@@ -16,6 +16,37 @@ function Get-Brush($hex) {
     return New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.ColorConverter]::ConvertFromString($hex))
 }
 
+function Get-Color($hex) {
+    return [System.Windows.Media.ColorConverter]::ConvertFromString($hex)
+}
+
+function Get-LimitAccent($usedPercent) {
+    $used = [Math]::Max(0, [Math]::Min(100, [double]$usedPercent))
+    if ($used -ge 90) {
+        return "#FF8A3D"
+    }
+
+    if ($used -ge 75) {
+        return "#FFC857"
+    }
+
+    if ($used -ge 50) {
+        return "#D7F85A"
+    }
+
+    return "#A6FF4F"
+}
+
+function Set-LimitAccent($row, $usedPercent, $enabled) {
+    $accent = if ($enabled) { Get-LimitAccent $usedPercent } else { "#6F7D85" }
+    $row.fill.Background = Get-Brush $accent
+    $row.value.Foreground = Get-Brush $accent
+    if ($row.fill.Effect) {
+        $row.fill.Effect.Color = Get-Color $accent
+        $row.fill.Effect.Opacity = if ($enabled) { 0.42 } else { 0.12 }
+    }
+}
+
 function New-TextBlock($text, $fontSize, $weight, $color) {
     $block = New-Object System.Windows.Controls.TextBlock
     $block.Text = $text
@@ -357,6 +388,7 @@ function Update-LimitRow($row, $limit, $resetText, $timeText) {
         $row.value.Text = "n/a"
         $row.reset.Text = $resetText
         $row.left.Text = $timeText
+        Set-LimitAccent $row 0 $false
         Set-Progress $row 0
         Set-TimeProgress $row 0
         return
@@ -366,6 +398,7 @@ function Update-LimitRow($row, $limit, $resetText, $timeText) {
     $row.value.Text = "%$percent"
     $row.reset.Text = $resetText
     $row.left.Text = $timeText
+    Set-LimitAccent $row $percent $true
     Set-Progress $row $percent
     Set-TimeProgress $row (Get-TimeLeftPercent $limit)
 }
