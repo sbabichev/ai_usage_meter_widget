@@ -496,7 +496,7 @@ function Build-Widget {
     $window.Left = [double]$state.left
     $window.Top = [double]$state.top
     $window.Opacity = [double]$state.opacity
-    $window.ShowInTaskbar = $true
+    $window.ShowInTaskbar = $false
 
     $outer = New-Object System.Windows.Controls.Border
     $outer.Margin = "8"
@@ -578,7 +578,7 @@ function Build-Widget {
 
         if ($event.ClickCount -ge 2) {
             Save-State $window
-            $window.WindowState = "Minimized"
+            $window.Hide()
             return
         }
 
@@ -594,6 +594,14 @@ function Build-Widget {
         if ($null -ne $tray) {
             $tray.Visible = $false
             $tray.Dispose()
+        }
+    })
+
+    $window.Add_StateChanged({
+        if ($window.WindowState -eq [System.Windows.WindowState]::Minimized) {
+            Save-State $window
+            $window.Hide()
+            $window.WindowState = [System.Windows.WindowState]::Normal
         }
     })
 
