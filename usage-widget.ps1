@@ -264,6 +264,7 @@ function Set-Progress($row, $percent) {
 
 function Set-TimeProgress($row, $percent) {
     $safePercent = [Math]::Max(0, [Math]::Min(100, [double]$percent))
+    $elapsedPercent = 100 - $safePercent
     $row.timePercent = $safePercent
     $accent = if ($safePercent -le 12) {
         "#FF8A3D"
@@ -273,7 +274,11 @@ function Set-TimeProgress($row, $percent) {
         "#D6E2E8"
     }
 
-    $row.timeFill.Width = [Math]::Max(7, $row.timeTrack.ActualWidth * ($safePercent / 100))
+    $trackWidth = $row.timeTrack.ActualWidth
+    $row.timeElapsed.Width = if ($elapsedPercent -le 0) { 0 } else { [Math]::Max(3, $trackWidth * ($elapsedPercent / 100)) }
+    $row.timeFill.Width = if ($safePercent -le 0) { 0 } else { [Math]::Max(7, $trackWidth * ($safePercent / 100)) }
+    $row.timeElapsed.Background = if ($safePercent -le 30) { Get-Brush "#6B3F2D" } else { Get-Brush "#435865" }
+    $row.timeElapsed.Opacity = if ($safePercent -le 30) { 0.42 } else { 0.26 }
     $row.timeFill.Background = Get-Brush $accent
     $row.timeFill.Opacity = if ($safePercent -le 30) { 0.86 } else { 0.64 }
     if ($row.timeFill.Effect) {
@@ -373,9 +378,17 @@ function New-LimitRow($title, $large, $timeSegments) {
         Color = [System.Windows.Media.ColorConverter]::ConvertFromString("#D6E2E8")
     }
 
+    $timeElapsed = New-Object System.Windows.Controls.Border
+    $timeElapsed.Height = 5
+    $timeElapsed.CornerRadius = 2.5
+    $timeElapsed.HorizontalAlignment = "Left"
+    $timeElapsed.Background = Get-Brush "#435865"
+    $timeElapsed.Opacity = 0.26
+
     $timeBar = New-Object System.Windows.Controls.Grid
     $timeBar.Margin = "0,5,0,0"
     $timeBar.Children.Add($timeTrack) | Out-Null
+    $timeBar.Children.Add($timeElapsed) | Out-Null
     $timeBar.Children.Add($timeFill) | Out-Null
 
     if ($timeSegments -gt 1) {
@@ -411,6 +424,7 @@ function New-LimitRow($title, $large, $timeSegments) {
         left = $left
         percent = 0
         timeTrack = $timeTrack
+        timeElapsed = $timeElapsed
         timeFill = $timeFill
         timePercent = 0
     }
