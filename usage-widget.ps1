@@ -290,24 +290,22 @@ function Set-TimeProgress($row, $percent) {
     $safePercent = [Math]::Max(0, [Math]::Min(100, [double]$percent))
     $elapsedPercent = 100 - $safePercent
     $row.timePercent = $safePercent
-    $accent = if ($safePercent -le 12) {
+    $accent = if ($elapsedPercent -ge 88) {
         "#FF8A3D"
-    } elseif ($safePercent -le 30) {
+    } elseif ($elapsedPercent -ge 70) {
         "#FFC857"
     } else {
         "#D6E2E8"
     }
 
     $trackWidth = $row.timeTrack.ActualWidth
-    $row.timeElapsed.Width = if ($elapsedPercent -le 0) { 0 } else { [Math]::Max(3, $trackWidth * ($elapsedPercent / 100)) }
-    $row.timeFill.Width = if ($safePercent -le 0) { 0 } else { [Math]::Max(7, $trackWidth * ($safePercent / 100)) }
-    $row.timeElapsed.Background = if ($safePercent -le 30) { Get-Brush "#6B3F2D" } else { Get-Brush "#435865" }
-    $row.timeElapsed.Opacity = if ($safePercent -le 30) { 0.42 } else { 0.26 }
+    $row.timeElapsed.Width = 0
+    $row.timeFill.Width = if ($elapsedPercent -le 0) { 0 } else { [Math]::Max(7, $trackWidth * ($elapsedPercent / 100)) }
     $row.timeFill.Background = Get-Brush $accent
-    $row.timeFill.Opacity = if ($safePercent -le 30) { 0.86 } else { 0.64 }
+    $row.timeFill.Opacity = if ($elapsedPercent -ge 70) { 0.86 } else { 0.64 }
     if ($row.timeFill.Effect) {
         $row.timeFill.Effect.Color = Get-Color $accent
-        $row.timeFill.Effect.Opacity = if ($safePercent -le 30) { 0.42 } else { 0.18 }
+        $row.timeFill.Effect.Opacity = if ($elapsedPercent -ge 70) { 0.42 } else { 0.18 }
     }
 }
 
@@ -392,7 +390,7 @@ function New-LimitRow($title, $large, $timeSegments) {
     $timeFill = New-Object System.Windows.Controls.Border
     $timeFill.Height = 5
     $timeFill.CornerRadius = 2.5
-    $timeFill.HorizontalAlignment = "Right"
+    $timeFill.HorizontalAlignment = "Left"
     $timeFill.Background = Get-Brush "#D6E2E8"
     $timeFill.Opacity = 0.64
     $timeFill.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{
