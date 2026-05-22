@@ -10,9 +10,17 @@ $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:StatePath = Join-Path $script:AppDir "usage-widget.state.json"
 $script:CodexSessionsDir = Join-Path $env:USERPROFILE ".codex\sessions"
 $script:IconPath = Join-Path $script:AppDir "assets\codex-usage-meter.ico"
+$script:CodexUsageDashboardUrl = "https://chatgpt.com/codex/settings/usage"
 $script:WidgetWidth = 360
-$script:WidgetHeight = 262
+$script:WidgetHeight = 276
+$script:CompactWidth = 292
+$script:CompactHeight = 42
 $script:StaleAfterSeconds = 900
+$script:UsageFloorState = @{
+    WindowKey = ""
+    PrimaryUsed = $null
+    SecondaryUsed = $null
+}
 
 function Get-Brush($hex) {
     return New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.ColorConverter]::ConvertFromString($hex))
@@ -69,6 +77,43 @@ function New-Hairline($topMargin, $bottomMargin) {
     return $line
 }
 
+function Get-FileTailLines($path, $maxBytes) {
+    try {
+        $stream = [System.IO.File]::Open(
+            $path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        try {
+            $length = $stream.Length
+            $bytesToRead = [Math]::Min([int64]$maxBytes, $length)
+            $offset = $length - $bytesToRead
+            $stream.Seek($offset, [System.IO.SeekOrigin]::Begin) | Out-Null
+
+            $buffer = New-Object byte[] ([int]$bytesToRead)
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) {
+                return @()
+            }
+
+            $text = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+            if ($offset -gt 0) {
+                $firstNewline = $text.IndexOf("`n")
+                if ($firstNewline -ge 0 -and $firstNewline + 1 -lt $text.Length) {
+                    $text = $text.Substring($firstNewline + 1)
+                }
+            }
+
+            return @($text -split "`r?`n" | Where-Object { $_ })
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {
+        return @()
+    }
+}
+
 function Test-IsInsideButton($source) {
     $current = $source
     while ($null -ne $current) {
@@ -93,6 +138,7 @@ function Read-State {
         topmost = $true
         opacity = 0.96
         refreshSeconds = 3
+        usageFloor = $null
     }
 
     if (-not (Test-Path $script:StatePath)) {
@@ -120,11 +166,33 @@ function Save-State($window) {
             topmost = [bool]$window.Topmost
             opacity = [double]$window.Opacity
             refreshSeconds = 3
+            usageFloor = [ordered]@{
+                windowKey = if ($script:UsageFloorState.WindowKey) { [string]$script:UsageFloorState.WindowKey } else { "" }
+                primaryUsed = if ($null -ne $script:UsageFloorState.PrimaryUsed) { [double]$script:UsageFloorState.PrimaryUsed } else { $null }
+                secondaryUsed = if ($null -ne $script:UsageFloorState.SecondaryUsed) { [double]$script:UsageFloorState.SecondaryUsed } else { $null }
+            }
         }
         $json = $state | ConvertTo-Json -Depth 4
         [System.IO.File]::WriteAllText($script:StatePath, $json, [System.Text.Encoding]::UTF8)
     } catch {
     }
+}
+
+function Initialize-UsageFloorState($state) {
+    $script:UsageFloorState = @{
+        WindowKey = ""
+        PrimaryUsed = $null
+        SecondaryUsed = $null
+    }
+
+    if (-not $state -or -not $state.usageFloor) {
+        return
+    }
+
+    $floor = $state.usageFloor
+    $script:UsageFloorState.WindowKey = if ($floor.windowKey) { [string]$floor.windowKey } else { "" }
+    $script:UsageFloorState.PrimaryUsed = if ($null -ne $floor.primaryUsed) { Convert-ToNumber $floor.primaryUsed } else { $null }
+    $script:UsageFloorState.SecondaryUsed = if ($null -ne $floor.secondaryUsed) { Convert-ToNumber $floor.secondaryUsed } else { $null }
 }
 
 function Convert-UnixSeconds($seconds) {
@@ -283,6 +351,115 @@ function Get-UsageHint($primary, $secondary, $isStale) {
     }
 }
 
+function Convert-ToNumber($value) {
+    if ($null -eq $value) {
+        return 0
+    }
+
+    try {
+        return [double]$value
+    } catch {
+        return 0
+    }
+}
+
+function Convert-ToInt64($value) {
+    if ($null -eq $value) {
+        return [int64]0
+    }
+
+    try {
+        return [int64]$value
+    } catch {
+        return [int64]0
+    }
+}
+
+function Convert-ToTokenUsage($usage) {
+    if (-not $usage) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        input = Convert-ToInt64 $usage.input_tokens
+        cached = Convert-ToInt64 $usage.cached_input_tokens
+        output = Convert-ToInt64 $usage.output_tokens
+        reasoning = Convert-ToInt64 $usage.reasoning_output_tokens
+        total = Convert-ToInt64 $usage.total_tokens
+    }
+}
+
+function Get-TokenDelta($current, $previous) {
+    if (-not $current) {
+        return $null
+    }
+
+    if (-not $previous) {
+        return $current
+    }
+
+    return [pscustomobject]@{
+        input = [Math]::Max(0, $current.input - $previous.input)
+        cached = [Math]::Max(0, $current.cached - $previous.cached)
+        output = [Math]::Max(0, $current.output - $previous.output)
+        reasoning = [Math]::Max(0, $current.reasoning - $previous.reasoning)
+        total = [Math]::Max(0, $current.total - $previous.total)
+    }
+}
+
+function Add-TokenUsage($left, $right) {
+    if (-not $left) {
+        $left = [pscustomobject]@{ input = 0; cached = 0; output = 0; reasoning = 0; total = 0 }
+    }
+
+    if (-not $right) {
+        return $left
+    }
+
+    return [pscustomobject]@{
+        input = $left.input + $right.input
+        cached = $left.cached + $right.cached
+        output = $left.output + $right.output
+        reasoning = $left.reasoning + $right.reasoning
+        total = $left.total + $right.total
+    }
+}
+
+function Format-TokenCount($value) {
+    $number = [double](Convert-ToInt64 $value)
+    $absolute = [Math]::Abs($number)
+    $prefix = if ($number -lt 0) { "-" } else { "" }
+    $culture = [Globalization.CultureInfo]::InvariantCulture
+
+    if ($absolute -ge 1000000) {
+        return $prefix + ($absolute / 1000000).ToString("0.0", $culture) + "M"
+    }
+
+    if ($absolute -ge 1000) {
+        return $prefix + ($absolute / 1000).ToString("0.0", $culture) + "K"
+    }
+
+    return ("{0}" -f [int64]$number)
+}
+
+function Format-PercentDelta($value) {
+    if ($null -eq $value) {
+        return $null
+    }
+
+    $rounded = [Math]::Round([double]$value, 1)
+    if ([Math]::Abs($rounded) -lt 0.1) {
+        return "0%"
+    }
+
+    $sign = if ($rounded -gt 0) { "+" } else { "" }
+    if ([Math]::Abs($rounded - [Math]::Round($rounded)) -lt 0.01) {
+        return ("{0}{1}%" -f $sign, [int]$rounded)
+    }
+
+    return $sign + $rounded.ToString("0.0", [Globalization.CultureInfo]::InvariantCulture) + "%"
+}
+
 function Test-UsableCodexRateLimits($limits) {
     if (-not $limits) {
         return $false
@@ -303,35 +480,40 @@ function Test-UsableCodexRateLimits($limits) {
     return $true
 }
 
-function Get-LatestRateLimitLine {
+function Get-RateLimitHistory {
     if (-not (Test-Path $script:CodexSessionsDir)) {
         return $null
     }
 
     $files = Get-ChildItem -Path $script:CodexSessionsDir -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending |
-        Select-Object -First 60
+        Select-Object -First 30
 
-    $latest = $null
+    $snapshots = @()
 
     foreach ($file in $files) {
-        $matches = Select-String -Path $file.FullName -Pattern '"rate_limits"' -ErrorAction SilentlyContinue |
-            Select-Object -Last 20
-        foreach ($match in $matches) {
+        $lines = Get-FileTailLines $file.FullName (512 * 1024)
+        foreach ($line in $lines) {
+            if ($line -notmatch '"rate_limits"') {
+                continue
+            }
+
             try {
-                $event = $match.Line | ConvertFrom-Json
+                $event = $line | ConvertFrom-Json
                 $limits = $event.payload.rate_limits
                 if (-not (Test-UsableCodexRateLimits $limits)) {
                     continue
                 }
 
                 $stamp = [DateTimeOffset]::Parse($event.timestamp)
-                if (($null -eq $latest) -or ($stamp -gt $latest.Stamp)) {
-                    $latest = [pscustomobject]@{
-                        Stamp = $stamp
-                        Event = $event
-                        File = $file.FullName
-                    }
+                $snapshots += [pscustomobject]@{
+                    Stamp = $stamp
+                    Event = $event
+                    File = $file.FullName
+                    PrimaryUsed = Convert-ToNumber $limits.primary.used_percent
+                    SecondaryUsed = Convert-ToNumber $limits.secondary.used_percent
+                    PrimaryReset = Convert-ToInt64 $limits.primary.resets_at
+                    SecondaryReset = Convert-ToInt64 $limits.secondary.resets_at
                 }
             } catch {
                 continue
@@ -339,12 +521,285 @@ function Get-LatestRateLimitLine {
         }
     }
 
-    return $latest
+    $sorted = $snapshots | Sort-Object Stamp -Descending
+    $latest = $sorted | Select-Object -First 1
+    if (-not $latest) {
+        return $null
+    }
+
+    $sameWindow = $sorted | Where-Object {
+        ($_.PrimaryReset -eq $latest.PrimaryReset) -and
+        ($_.SecondaryReset -eq $latest.SecondaryReset)
+    }
+    $windowPrimaryMax = ($sameWindow | Measure-Object -Property PrimaryUsed -Maximum).Maximum
+    $windowSecondaryMax = ($sameWindow | Measure-Object -Property SecondaryUsed -Maximum).Maximum
+
+    if ($null -eq $windowPrimaryMax) {
+        $windowPrimaryMax = $latest.PrimaryUsed
+    }
+    if ($null -eq $windowSecondaryMax) {
+        $windowSecondaryMax = $latest.SecondaryUsed
+    }
+
+    # In the same reset window the consumed percentage should not move backwards.
+    if ($windowPrimaryMax -gt $latest.PrimaryUsed) {
+        $latest.PrimaryUsed = $windowPrimaryMax
+        $latest.Event.payload.rate_limits.primary.used_percent = $windowPrimaryMax
+    }
+    if ($windowSecondaryMax -gt $latest.SecondaryUsed) {
+        $latest.SecondaryUsed = $windowSecondaryMax
+        $latest.Event.payload.rate_limits.secondary.used_percent = $windowSecondaryMax
+    }
+
+    $previous = $sorted |
+        Select-Object -Skip 1 |
+        Where-Object {
+            ([Math]::Abs($_.PrimaryUsed - $latest.PrimaryUsed) -ge 0.01) -or
+            ([Math]::Abs($_.SecondaryUsed - $latest.SecondaryUsed) -ge 0.01)
+        } |
+        Select-Object -First 1
+
+    return [pscustomobject]@{
+        Latest = $latest
+        PreviousDistinct = $previous
+    }
+}
+
+function Apply-UsageFloor($limits) {
+    if (-not $limits -or -not $limits.primary -or -not $limits.secondary) {
+        return
+    }
+
+    $windowKey = "{0}:{1}" -f (Convert-ToInt64 $limits.primary.resets_at), (Convert-ToInt64 $limits.secondary.resets_at)
+    $primaryCurrent = Convert-ToNumber $limits.primary.used_percent
+    $secondaryCurrent = Convert-ToNumber $limits.secondary.used_percent
+
+    if ($script:UsageFloorState.WindowKey -ne $windowKey) {
+        $script:UsageFloorState.WindowKey = $windowKey
+        $script:UsageFloorState.PrimaryUsed = $primaryCurrent
+        $script:UsageFloorState.SecondaryUsed = $secondaryCurrent
+    } else {
+        if ($null -eq $script:UsageFloorState.PrimaryUsed) {
+            $script:UsageFloorState.PrimaryUsed = $primaryCurrent
+        } else {
+            $script:UsageFloorState.PrimaryUsed = [Math]::Max($script:UsageFloorState.PrimaryUsed, $primaryCurrent)
+        }
+
+        if ($null -eq $script:UsageFloorState.SecondaryUsed) {
+            $script:UsageFloorState.SecondaryUsed = $secondaryCurrent
+        } else {
+            $script:UsageFloorState.SecondaryUsed = [Math]::Max($script:UsageFloorState.SecondaryUsed, $secondaryCurrent)
+        }
+    }
+
+    $limits.primary.used_percent = $script:UsageFloorState.PrimaryUsed
+    $limits.secondary.used_percent = $script:UsageFloorState.SecondaryUsed
+}
+
+function Get-TokenActivitySummary {
+    if (-not (Test-Path $script:CodexSessionsDir)) {
+        return $null
+    }
+
+    $files = Get-ChildItem -Path $script:CodexSessionsDir -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 6
+
+    $sessionScans = @()
+
+    foreach ($file in $files) {
+        $sequence = 0
+        $taskStarts = @()
+        $tokenEvents = @()
+
+        $lines = Get-FileTailLines $file.FullName (1024 * 1024)
+        foreach ($line in $lines) {
+            $sequence++
+            if (($line -notmatch '"token_count"') -and ($line -notmatch '"task_started"')) {
+                continue
+            }
+
+            try {
+                $event = $line | ConvertFrom-Json
+                $stamp = [DateTimeOffset]::Parse($event.timestamp)
+                $payload = $event.payload
+                if (-not $payload -or -not $payload.type) {
+                    continue
+                }
+
+                if ($payload.type -eq "task_started") {
+                    $taskStarts += $stamp
+                    continue
+                }
+
+                if ($payload.type -ne "token_count" -or -not $payload.info) {
+                    continue
+                }
+
+                $total = Convert-ToTokenUsage $payload.info.total_token_usage
+                $last = Convert-ToTokenUsage $payload.info.last_token_usage
+                if (-not $total -or -not $last) {
+                    continue
+                }
+
+                $tokenEvents += [pscustomobject]@{
+                    File = $file.FullName
+                    Stamp = $stamp
+                    Sequence = $sequence
+                    Total = $total
+                    Last = $last
+                }
+            } catch {
+                continue
+            }
+        }
+
+        if ($taskStarts.Count -gt 0 -or $tokenEvents.Count -gt 0) {
+            $sessionScans += [pscustomobject]@{
+                File = $file.FullName
+                TaskStarts = $taskStarts
+                TokenEvents = $tokenEvents
+            }
+        }
+    }
+
+    $allTokenEvents = @($sessionScans | ForEach-Object { $_.TokenEvents } | Where-Object { $_ })
+    $latestCall = $allTokenEvents |
+        Sort-Object Stamp, Sequence -Descending |
+        Select-Object -First 1
+
+    $latestTask = $sessionScans |
+        ForEach-Object {
+            $scan = $_
+            $scan.TaskStarts | ForEach-Object {
+                [pscustomobject]@{
+                    File = $scan.File
+                    Stamp = $_
+                }
+            }
+        } |
+        Sort-Object Stamp -Descending |
+        Select-Object -First 1
+
+    $latestTurnUsage = $null
+    if ($latestTask) {
+        $scan = $sessionScans | Where-Object { $_.File -eq $latestTask.File } | Select-Object -First 1
+        if ($scan) {
+            $events = @($scan.TokenEvents | Sort-Object Stamp, Sequence)
+            $latestAfterStart = $events | Where-Object { $_.Stamp -ge $latestTask.Stamp } | Select-Object -Last 1
+            if ($latestAfterStart) {
+                $previousBeforeStart = $events | Where-Object { $_.Stamp -lt $latestTask.Stamp } | Select-Object -Last 1
+                if ($previousBeforeStart) {
+                    $latestTurnUsage = Get-TokenDelta $latestAfterStart.Total $previousBeforeStart.Total
+                } else {
+                    $firstAfterStart = $events | Where-Object { $_.Stamp -ge $latestTask.Stamp } | Select-Object -First 1
+                    if ($firstAfterStart -and $firstAfterStart.Sequence -ne $latestAfterStart.Sequence) {
+                        $latestTurnUsage = Get-TokenDelta $latestAfterStart.Total $firstAfterStart.Total
+                    } else {
+                        $latestTurnUsage = $latestAfterStart.Last
+                    }
+                }
+            }
+        }
+    }
+
+    $cutoff = (Get-Date).AddMinutes(-3)
+    $recentUsage = [pscustomobject]@{ input = 0; cached = 0; output = 0; reasoning = 0; total = 0 }
+    foreach ($scan in $sessionScans) {
+        $events = @($scan.TokenEvents | Sort-Object Stamp, Sequence)
+        $previous = $null
+        foreach ($event in $events) {
+            if ($event.Stamp.LocalDateTime -ge $cutoff -and $previous) {
+                $delta = Get-TokenDelta $event.Total $previous.Total
+                if ($delta -and $delta.total -gt 0) {
+                    $recentUsage = Add-TokenUsage $recentUsage $delta
+                }
+            }
+
+            $previous = $event
+        }
+    }
+
+    return [pscustomobject]@{
+        LatestCall = if ($latestCall) { $latestCall.Last } else { $null }
+        LatestTurn = $latestTurnUsage
+        Recent = $recentUsage
+        ObservedAt = if ($latestCall) { $latestCall.Stamp.LocalDateTime } else { $null }
+    }
+}
+
+function Format-ActivityText($usage, $activity) {
+    $parts = @()
+
+    if ($usage -and $null -ne $usage.primaryDelta) {
+        if ($usage.primaryDelta -gt 0.05) {
+            $parts += ("session {0}" -f $usage.primaryDeltaText)
+        } elseif ($usage.primaryDelta -lt -0.05) {
+            $parts += "session reset"
+        }
+    }
+
+    if ($usage -and $null -ne $usage.secondaryDelta) {
+        if ($usage.secondaryDelta -gt 0.05) {
+            $parts += ("week {0}" -f $usage.secondaryDeltaText)
+        } elseif ($usage.secondaryDelta -lt -0.05) {
+            $parts += "week reset"
+        }
+    }
+
+    $tokenUsage = $null
+    $usageLabel = if ($activity -and $activity.LatestTurn -and $activity.LatestTurn.total -gt 0) {
+        $tokenUsage = $activity.LatestTurn
+        "turn {0} tok" -f (Format-TokenCount $tokenUsage.total)
+    } elseif ($activity -and $activity.LatestCall -and $activity.LatestCall.total -gt 0) {
+        $tokenUsage = $activity.LatestCall
+        "call {0} tok" -f (Format-TokenCount $tokenUsage.total)
+    } else {
+        $null
+    }
+
+    if ($usageLabel) {
+        $parts += $usageLabel
+    }
+
+    if ($tokenUsage -and $tokenUsage.output -gt 0) {
+        $parts += ("out {0}" -f (Format-TokenCount $tokenUsage.output))
+    }
+
+    if ($parts.Count -eq 0) {
+        return "Last activity: waiting for token details"
+    }
+
+    return "Last activity: " + ($parts -join " | ")
+}
+
+function Format-TokenUsageDetail($label, $usage) {
+    if (-not $usage -or $usage.total -le 0) {
+        return "${label}: unknown"
+    }
+
+    return "{0}: {1} tok (in {2}, out {3})" -f `
+        $label,
+        (Format-TokenCount $usage.total),
+        (Format-TokenCount $usage.input),
+        (Format-TokenCount $usage.output)
+}
+
+function Format-ActivityTooltip($usage, $activity) {
+    $lines = @((Format-ActivityText $usage $activity))
+
+    if ($activity) {
+        $lines += Format-TokenUsageDetail "Last turn" $activity.LatestTurn
+        $lines += Format-TokenUsageDetail "Latest call" $activity.LatestCall
+        $lines += Format-TokenUsageDetail "Last 3 min" $activity.Recent
+    }
+
+    return $lines -join [Environment]::NewLine
 }
 
 function Get-CodexUsage {
-    $latest = Get-LatestRateLimitLine
-    if (-not $latest) {
+    $history = Get-RateLimitHistory
+    if (-not $history) {
         return [pscustomobject]@{
             ok = $false
             message = "Waiting for Codex limits"
@@ -355,8 +810,13 @@ function Get-CodexUsage {
         }
     }
 
+    $latest = $history.Latest
+    $previous = $history.PreviousDistinct
     $limits = $latest.Event.payload.rate_limits
+    Apply-UsageFloor $limits
     $age = (Get-Date) - $latest.Stamp.LocalDateTime
+    $primaryDelta = if ($previous) { $latest.PrimaryUsed - $previous.PrimaryUsed } else { $null }
+    $secondaryDelta = if ($previous) { $latest.SecondaryUsed - $previous.SecondaryUsed } else { $null }
     return [pscustomobject]@{
         ok = $true
         message = $null
@@ -364,6 +824,10 @@ function Get-CodexUsage {
         updated = $latest.Stamp.LocalDateTime
         isStale = ($age.TotalSeconds -gt $script:StaleAfterSeconds)
         staleText = if ($age.TotalSeconds -gt $script:StaleAfterSeconds) { "Updated {0}m ago" -f [Math]::Max(1, [Math]::Floor($age.TotalMinutes)) } else { "" }
+        primaryDelta = $primaryDelta
+        secondaryDelta = $secondaryDelta
+        primaryDeltaText = Format-PercentDelta $primaryDelta
+        secondaryDeltaText = Format-PercentDelta $secondaryDelta
         primary = $limits.primary
         secondary = $limits.secondary
     }
@@ -578,8 +1042,175 @@ function Update-LimitRow($row, $limit, $resetText, $timeText) {
     Set-TimeProgress $row (Get-TimeLeftPercent $limit)
 }
 
+function Show-UsageWindow($window) {
+    $window.Show()
+    $window.WindowState = "Normal"
+    $window.Activate() | Out-Null
+}
+
+function Set-CompactWindowPlacement($window) {
+    $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $window.Left = $area.Right - $window.Width - 12
+    $window.Top = $area.Bottom - $window.Height - 8
+}
+
+function New-CompactBar {
+    $track = New-Object System.Windows.Controls.Border
+    $track.Height = 3
+    $track.CornerRadius = 1.5
+    $track.Background = Get-Brush "#60717B"
+    $track.Opacity = 0.4
+
+    $fill = New-Object System.Windows.Controls.Border
+    $fill.Height = 3
+    $fill.CornerRadius = 1.5
+    $fill.HorizontalAlignment = "Left"
+    $fill.Background = Get-Brush "#A6FF4F"
+
+    $bar = New-Object System.Windows.Controls.Grid
+    $bar.Children.Add($track) | Out-Null
+    $bar.Children.Add($fill) | Out-Null
+
+    $row = [pscustomobject]@{
+        Bar = $bar
+        Fill = $fill
+        Percent = 0
+    }
+
+    $bar.Tag = $row
+    $bar.Add_SizeChanged({
+        param($sender)
+        $data = $sender.Tag
+        $safePercent = [Math]::Max(0, [Math]::Min(100, [double]$data.Percent))
+        $data.Fill.Width = if ($safePercent -le 0) { 0 } else { [Math]::Max(4, $sender.ActualWidth * ($safePercent / 100)) }
+    })
+
+    return $row
+}
+
+function Set-CompactProgress($row, $percent, $enabled) {
+    $safePercent = [Math]::Max(0, [Math]::Min(100, [double]$percent))
+    $row.Percent = $safePercent
+    $accent = if ($enabled) { Get-LimitAccent $safePercent } else { "#6F7D85" }
+    $row.Fill.Background = Get-Brush $accent
+    $row.Fill.Width = if ($safePercent -le 0) { 0 } else { [Math]::Max(4, $row.Bar.ActualWidth * ($safePercent / 100)) }
+}
+
+function New-CompactStatusWindow($detailWindow) {
+    $compact = New-Object System.Windows.Window
+    $compact.Title = "Codex Usage Meter Compact"
+    $compact.Width = $script:CompactWidth
+    $compact.Height = $script:CompactHeight
+    $compact.MinWidth = $script:CompactWidth
+    $compact.MaxWidth = $script:CompactWidth
+    $compact.MinHeight = $script:CompactHeight
+    $compact.MaxHeight = $script:CompactHeight
+    $compact.WindowStyle = "None"
+    $compact.AllowsTransparency = $true
+    $compact.Background = [System.Windows.Media.Brushes]::Transparent
+    $compact.ResizeMode = "NoResize"
+    $compact.Topmost = $true
+    $compact.ShowInTaskbar = $false
+    Set-CompactWindowPlacement $compact
+
+    $outer = New-Object System.Windows.Controls.Border
+    $outer.Padding = "10,6,10,6"
+    $outer.CornerRadius = 10
+    $outer.BorderThickness = 1
+    $outer.BorderBrush = Get-Brush "#7E8E96"
+    $outer.Background = Get-Brush "#EA0E1821"
+    $outer.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{
+        BlurRadius = 18
+        ShadowDepth = 0
+        Opacity = 0.34
+        Color = [System.Windows.Media.ColorConverter]::ConvertFromString("#02080E")
+    }
+
+    $root = New-Object System.Windows.Controls.Grid
+    $root.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
+    $root.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
+
+    $line = New-Object System.Windows.Controls.Grid
+    $line.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
+    $line.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    $line.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
+
+    $brand = New-TextBlock "Codex" 10 "SemiBold" "#F6FAFC"
+    $brand.Opacity = 0.72
+    $brand.Margin = "0,0,10,0"
+    $status = New-TextBlock "S --   W --" 12 "SemiBold" "#D6E2E8"
+    [System.Windows.Controls.Grid]::SetColumn($status, 1)
+    $time = New-TextBlock "--" 10 "Regular" "#C8D2D8"
+    $time.Margin = "10,1,0,0"
+    [System.Windows.Controls.Grid]::SetColumn($time, 2)
+    $line.Children.Add($brand) | Out-Null
+    $line.Children.Add($status) | Out-Null
+    $line.Children.Add($time) | Out-Null
+
+    $bars = New-Object System.Windows.Controls.Grid
+    $bars.Margin = "0,5,0,0"
+    $bars.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    $bars.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "8" }))
+    $bars.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    [System.Windows.Controls.Grid]::SetRow($bars, 1)
+
+    $sessionBar = New-CompactBar
+    $weeklyBar = New-CompactBar
+    [System.Windows.Controls.Grid]::SetColumn($weeklyBar.Bar, 2)
+    $bars.Children.Add($sessionBar.Bar) | Out-Null
+    $bars.Children.Add($weeklyBar.Bar) | Out-Null
+
+    $root.Children.Add($line) | Out-Null
+    $root.Children.Add($bars) | Out-Null
+    $outer.Child = $root
+    $compact.Content = $outer
+
+    $outer.Add_MouseLeftButtonDown({
+        param($sender, $event)
+        if ($event.ClickCount -ge 2) {
+            Show-UsageWindow $detailWindow
+        }
+    })
+
+    $compact.Show()
+
+    return [pscustomobject]@{
+        Window = $compact
+        Status = $status
+        Time = $time
+        SessionBar = $sessionBar
+        WeeklyBar = $weeklyBar
+    }
+}
+
+function Update-CompactStatus($compact, $usage, $activity) {
+    if (-not $compact) {
+        return
+    }
+
+    if (-not $usage.ok) {
+        $compact.Status.Text = "Waiting for limits"
+        $compact.Status.Foreground = Get-Brush "#D6E2E8"
+        $compact.Time.Text = "WAIT"
+        Set-CompactProgress $compact.SessionBar 0 $false
+        Set-CompactProgress $compact.WeeklyBar 0 $false
+        $compact.Window.ToolTip = Format-ActivityTooltip $null $activity
+        return
+    }
+
+    $sessionPercent = [Math]::Round([double]$usage.primary.used_percent)
+    $weeklyPercent = [Math]::Round([double]$usage.secondary.used_percent)
+    $compact.Status.Text = "S {0}%   W {1}%" -f $sessionPercent, $weeklyPercent
+    $compact.Status.Foreground = Get-Brush (Get-LimitAccent ([Math]::Max($sessionPercent, $weeklyPercent)))
+    $compact.Time.Text = Format-Remaining $usage.primary.resets_at
+    Set-CompactProgress $compact.SessionBar $sessionPercent $true
+    Set-CompactProgress $compact.WeeklyBar $weeklyPercent $true
+    $compact.Window.ToolTip = Format-ActivityTooltip $usage $activity
+}
+
 function Update-Widget($controls) {
     $usage = Get-CodexUsage
+    $activity = Get-TokenActivitySummary
 
     if (-not $usage.ok) {
         $controls.Plan.Text = "WAIT"
@@ -588,7 +1219,10 @@ function Update-Widget($controls) {
         $hint = Get-UsageHint $null $null $false
         $controls.Hint.Text = $hint.Text
         $controls.Hint.Foreground = Get-Brush $hint.Color
+        $controls.Activity.Text = Format-ActivityText $null $activity
+        $controls.Activity.ToolTip = Format-ActivityTooltip $null $activity
         $controls.Updated.Text = "Updated " + (Get-Date).ToString("HH:mm:ss")
+        Update-CompactStatus $controls.Compact $usage $activity
         return
     }
 
@@ -603,10 +1237,13 @@ function Update-Widget($controls) {
     $hint = Get-UsageHint $usage.primary $usage.secondary $usage.isStale
     $controls.Hint.Text = $hint.Text
     $controls.Hint.Foreground = Get-Brush $hint.Color
+    $controls.Activity.Text = Format-ActivityText $usage $activity
+    $controls.Activity.ToolTip = Format-ActivityTooltip $usage $activity
     $controls.Updated.Text = "Updated " + $usage.updated.ToString("HH:mm:ss")
+    Update-CompactStatus $controls.Compact $usage $activity
 }
 
-function New-TrayIcon($window) {
+function New-TrayIcon($window, $compact) {
     $tray = New-Object System.Windows.Forms.NotifyIcon
     $tray.Text = "Codex Usage Meter"
     if (Test-Path $script:IconPath) {
@@ -618,17 +1255,34 @@ function New-TrayIcon($window) {
 
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
     $showItem = $menu.Items.Add("Show")
+    $compactItem = $menu.Items.Add("Hide Compact Status")
+    $dashboardItem = $menu.Items.Add("Open Codex Usage Dashboard")
     $exitItem = $menu.Items.Add("Exit")
     $tray.ContextMenuStrip = $menu
 
     $showAction = {
-        $window.Show()
-        $window.WindowState = "Normal"
-        $window.Activate() | Out-Null
+        Show-UsageWindow $window
     }
 
     $showItem.Add_Click($showAction)
     $tray.Add_DoubleClick($showAction)
+    $compactItem.Add_Click({
+        if ($null -eq $compact -or $null -eq $compact.Window) {
+            return
+        }
+
+        if ($compact.Window.IsVisible) {
+            $compact.Window.Hide()
+            $compactItem.Text = "Show Compact Status"
+        } else {
+            Set-CompactWindowPlacement $compact.Window
+            $compact.Window.Show()
+            $compactItem.Text = "Hide Compact Status"
+        }
+    })
+    $dashboardItem.Add_Click({
+        [System.Diagnostics.Process]::Start($script:CodexUsageDashboardUrl) | Out-Null
+    })
     $exitItem.Add_Click({
         $window.Close()
     })
@@ -638,6 +1292,7 @@ function New-TrayIcon($window) {
 
 function Build-Widget {
     $state = Read-State
+    Initialize-UsageFloorState $state
 
     $window = New-Object System.Windows.Window
     $window.Title = "Codex Usage Meter"
@@ -663,7 +1318,7 @@ function Build-Widget {
 
     $outer = New-Object System.Windows.Controls.Border
     $outer.Margin = "8"
-    $outer.Padding = "18,14,18,12"
+    $outer.Padding = "18,14,18,7"
     $outer.CornerRadius = 20
     $outer.BorderThickness = 1
     $outer.BorderBrush = Get-Brush "#AAB7BD"
@@ -717,10 +1372,15 @@ function Build-Widget {
     $content.Children.Add($weekly.panel) | Out-Null
     $content.Children.Add((New-Hairline 9 0)) | Out-Null
 
+    $activity = New-TextBlock "Last activity: waiting for token details" 9 "Regular" "#E2E9EC"
+    $activity.Margin = "0,7,0,0"
+    $activity.Opacity = 0.74
+
     $hint = New-TextBlock "Usage pace looks balanced." 9.5 "Regular" "#D6E2E8"
-    $hint.Margin = "0,7,0,0"
+    $hint.Margin = "0,4,0,0"
     $hint.Opacity = 0.78
 
+    $content.Children.Add($activity) | Out-Null
     $content.Children.Add($hint) | Out-Null
     $root.Children.Add($content) | Out-Null
 
@@ -730,15 +1390,19 @@ function Build-Widget {
     $outer.Child = $root
     $window.Content = $outer
 
+    $compact = New-CompactStatusWindow $window
+
     $controls = [pscustomobject]@{
         Plan = $plan
         Current = $current
         Weekly = $weekly
+        Activity = $activity
         Hint = $hint
         Updated = $updated
+        Compact = $compact
     }
 
-    $tray = New-TrayIcon $window
+    $tray = New-TrayIcon $window $compact
 
     $dragHandler = {
         param($sender, $event)
@@ -761,6 +1425,9 @@ function Build-Widget {
     $window.Add_LocationChanged({ Save-State $window })
     $window.Add_Closed({
         Save-State $window
+        if ($null -ne $compact -and $null -ne $compact.Window) {
+            $compact.Window.Close()
+        }
         if ($null -ne $tray) {
             $tray.Visible = $false
             $tray.Dispose()

@@ -6,6 +6,7 @@ It reads the real `rate_limits` events that Codex writes locally and shows:
 
 - current 5-hour session usage;
 - weekly usage;
+- last activity impact, combining the latest visible limit movement with local token usage;
 - exact reset time;
 - time remaining until reset;
 - a green usage bar and a subtle time-remaining bar.
@@ -52,13 +53,15 @@ The widget scans the newest session files, finds the latest `token_count` event 
 - `resets_at` and `window_minutes` for reset and time-remaining progress;
 - `plan_type` for the wordmark tier.
 
+It also compares the latest usable rate-limit snapshot with the previous distinct snapshot and reads local `token_count` / `task_started` events to estimate the most recent turn, latest model call, and last 3 minutes of token usage. The widget keeps this compact on-screen and exposes the fuller token summary in the last-activity tooltip. These token numbers are local estimates from Codex logs, not official billing records.
+
 The widget refreshes every 3 seconds and ignores non-Codex or incomplete rate-limit events.
 
 ## Controls
 
 - Drag anywhere on the glass panel to move it.
-- Double-click the panel to minimize it to the taskbar.
-- Use the tray icon menu for `Show` and `Exit`.
+- Double-click the panel to hide it to the tray.
+- Use the tray icon menu for `Show`, `Open Codex Usage Dashboard`, and `Exit`.
 - Double-click the tray icon to show the widget.
 
 ## Files

@@ -1,0 +1,39 @@
+﻿{
+    "accountName":  "Nurullah",
+    "planName":  "Max 20x",
+    "usageUrl":  "https://claude.ai/settings/usage",
+    "showRemainingTime":  true,
+    "lastUpdated":  null,
+    "limits":  {
+                   "weekly":  {
+                                  "title":  "Weekly limit",
+                                  "remainingText":  "3d 18h left",
+                                  "items":  [
+                                                {
+                                                    "label":  "All models",
+                                                    "percent":  34
+                                                },
+                                                {
+                                                    "label":  "Sonnet",
+                                                    "percent":  2
+                                                }
+                                            ]
+                              },
+                   "session":  {
+                                   "title":  "Current session",
+                                   "remainingText":  "2h 25m left",
+                                   "items":  [
+                                                 {
+                                                     "label":  "Usage",
+                                                     "percent":  11
+                                                 }
+                                             ]
+                               }
+               },
+    "window":  {
+                   "left":  0,
+                   "top":  1652,
+                   "opacity":  0.96,
+                   "topmost":  true
+               }
+}
