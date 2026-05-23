@@ -748,12 +748,12 @@ function Format-ActivityText($usage, $activity) {
     }
 
     $tokenUsage = $null
-    $usageLabel = if ($activity -and $activity.LatestTurn -and $activity.LatestTurn.total -gt 0) {
+    $usageLabel = if ($activity -and $activity.LatestCall -and $activity.LatestCall.total -gt 0) {
+        $tokenUsage = $activity.LatestCall
+        "request {0} tok" -f (Format-TokenCount $tokenUsage.total)
+    } elseif ($activity -and $activity.LatestTurn -and $activity.LatestTurn.total -gt 0) {
         $tokenUsage = $activity.LatestTurn
         "turn {0} tok" -f (Format-TokenCount $tokenUsage.total)
-    } elseif ($activity -and $activity.LatestCall -and $activity.LatestCall.total -gt 0) {
-        $tokenUsage = $activity.LatestCall
-        "call {0} tok" -f (Format-TokenCount $tokenUsage.total)
     } else {
         $null
     }
