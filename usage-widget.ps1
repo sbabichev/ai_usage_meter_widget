@@ -12,9 +12,16 @@ $script:CodexSessionsDir = Join-Path $env:USERPROFILE ".codex\sessions"
 $script:IconPath = Join-Path $script:AppDir "assets\codex-usage-meter.ico"
 $script:CodexUsageDashboardUrl = "https://chatgpt.com/codex/settings/usage"
 $script:WidgetWidth = 360
-$script:WidgetHeight = 276
+$script:WidgetHeight = 240
+$script:CompactWidth = 292
+$script:CompactHeight = 42
 $script:StaleAfterSeconds = 900
 $script:UsageFloorState = @{
+    WindowKey = ""
+    PrimaryUsed = $null
+    SecondaryUsed = $null
+}
+$script:MinimaxFloorState = @{
     WindowKey = ""
     PrimaryUsed = $null
     SecondaryUsed = $null
@@ -478,7 +485,27 @@ function Test-UsableCodexRateLimits($limits) {
     return $true
 }
 
-function Get-RateLimitHistory {
+function Test-UsableMinimaxRateLimits($limits) {
+    if (-not $limits) {
+        return $false
+    }
+
+    if ($limits.limit_id -and $limits.limit_id -ne "minimax") {
+        return $false
+    }
+
+    if (-not $limits.primary -or -not $limits.secondary) {
+        return $false
+    }
+
+    if ($null -eq $limits.primary.used_percent -or $null -eq $limits.secondary.used_percent) {
+        return $false
+    }
+
+    return $true
+}
+
+function Get-RateLimitHistory($limitId = "codex") {
     if (-not (Test-Path $script:CodexSessionsDir)) {
         return $null
     }
@@ -488,6 +515,7 @@ function Get-RateLimitHistory {
         Select-Object -First 30
 
     $snapshots = @()
+    $testLimitsFunc = if ($limitId -eq "minimax") { ${function:Test-UsableMinimaxRateLimits} } else { ${function:Test-UsableCodexRateLimits} }
 
     foreach ($file in $files) {
         $lines = Get-FileTailLines $file.FullName (512 * 1024)
@@ -499,7 +527,7 @@ function Get-RateLimitHistory {
             try {
                 $event = $line | ConvertFrom-Json
                 $limits = $event.payload.rate_limits
-                if (-not (Test-UsableCodexRateLimits $limits)) {
+                if (-not (& $testLimitsFunc $limits)) {
                     continue
                 }
 
@@ -831,6 +859,73 @@ function Get-CodexUsage {
     }
 }
 
+function Apply-MinimaxFloor($limits) {
+    if (-not $limits -or -not $limits.primary -or -not $limits.secondary) {
+        return
+    }
+
+    $windowKey = "{0}:{1}" -f (Convert-ToInt64 $limits.primary.resets_at), (Convert-ToInt64 $limits.secondary.resets_at)
+    $primaryCurrent = Convert-ToNumber $limits.primary.used_percent
+    $secondaryCurrent = Convert-ToNumber $limits.secondary.used_percent
+
+    if ($script:MinimaxFloorState.WindowKey -ne $windowKey) {
+        $script:MinimaxFloorState.WindowKey = $windowKey
+        $script:MinimaxFloorState.PrimaryUsed = $primaryCurrent
+        $script:MinimaxFloorState.SecondaryUsed = $secondaryCurrent
+    } else {
+        if ($null -eq $script:MinimaxFloorState.PrimaryUsed) {
+            $script:MinimaxFloorState.PrimaryUsed = $primaryCurrent
+        } else {
+            $script:MinimaxFloorState.PrimaryUsed = [Math]::Max($script:MinimaxFloorState.PrimaryUsed, $primaryCurrent)
+        }
+
+        if ($null -eq $script:MinimaxFloorState.SecondaryUsed) {
+            $script:MinimaxFloorState.SecondaryUsed = $secondaryCurrent
+        } else {
+            $script:MinimaxFloorState.SecondaryUsed = [Math]::Max($script:MinimaxFloorState.SecondaryUsed, $secondaryCurrent)
+        }
+    }
+
+    $limits.primary.used_percent = $script:MinimaxFloorState.PrimaryUsed
+    $limits.secondary.used_percent = $script:MinimaxFloorState.SecondaryUsed
+}
+
+function Get-MinimaxUsage {
+    $history = Get-RateLimitHistory "minimax"
+    if (-not $history) {
+        return [pscustomobject]@{
+            ok = $false
+            message = "Waiting for Minimax limits"
+            plan = "unknown"
+            updated = Get-Date
+            primary = $null
+            secondary = $null
+        }
+    }
+
+    $latest = $history.Latest
+    $previous = $history.PreviousDistinct
+    $limits = $latest.Event.payload.rate_limits
+    Apply-MinimaxFloor $limits
+    $age = (Get-Date) - $latest.Stamp.LocalDateTime
+    $primaryDelta = if ($previous) { $latest.PrimaryUsed - $previous.PrimaryUsed } else { $null }
+    $secondaryDelta = if ($previous) { $latest.SecondaryUsed - $previous.SecondaryUsed } else { $null }
+    return [pscustomobject]@{
+        ok = $true
+        message = $null
+        plan = $limits.plan_type
+        updated = $latest.Stamp.LocalDateTime
+        isStale = ($age.TotalSeconds -gt $script:StaleAfterSeconds)
+        staleText = if ($age.TotalSeconds -gt $script:StaleAfterSeconds) { "Updated {0}m ago" -f [Math]::Max(1, [Math]::Floor($age.TotalMinutes)) } else { "" }
+        primaryDelta = $primaryDelta
+        secondaryDelta = $secondaryDelta
+        primaryDeltaText = Format-PercentDelta $primaryDelta
+        secondaryDeltaText = Format-PercentDelta $secondaryDelta
+        primary = $limits.primary
+        secondary = $limits.secondary
+    }
+}
+
 function Set-Progress($row, $percent) {
     $safePercent = [Math]::Max(0, [Math]::Min(100, [double]$percent))
     $row.percent = $safePercent
@@ -1046,40 +1141,236 @@ function Show-UsageWindow($window) {
     $window.Activate() | Out-Null
 }
 
+function Set-CompactWindowPlacement($window, $anchorWindow) {
+    $screen = $null
+    if ($anchorWindow) {
+        $point = New-Object System.Drawing.Point ([int]$anchorWindow.Left + 8), ([int]$anchorWindow.Top + 8)
+        $screen = [System.Windows.Forms.Screen]::FromPoint($point)
+    }
+
+    if (-not $screen) {
+        $screen = [System.Windows.Forms.Screen]::PrimaryScreen
+    }
+
+    $area = $screen.WorkingArea
+    $window.Left = $area.Right - $window.Width - 12
+    $window.Top = $area.Bottom - $window.Height - 8
+}
+
+function Show-CompactAtPrimaryBottom($window) {
+    $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $window.Left = $area.Right - $window.Width - 12
+    $window.Top = $area.Bottom - $window.Height - 8
+    $window.Show()
+    $window.Activate() | Out-Null
+}
+
+function New-CompactBar {
+    $track = New-Object System.Windows.Controls.Border
+    $track.Height = 3
+    $track.CornerRadius = 1.5
+    $track.Background = Get-Brush "#60717B"
+    $track.Opacity = 0.4
+
+    $fill = New-Object System.Windows.Controls.Border
+    $fill.Height = 3
+    $fill.CornerRadius = 1.5
+    $fill.HorizontalAlignment = "Left"
+    $fill.Background = Get-Brush "#A6FF4F"
+
+    $bar = New-Object System.Windows.Controls.Grid
+    $bar.Children.Add($track) | Out-Null
+    $bar.Children.Add($fill) | Out-Null
+
+    $row = [pscustomobject]@{
+        Bar = $bar
+        Fill = $fill
+        Percent = 0
+    }
+
+    $bar.Tag = $row
+    $bar.Add_SizeChanged({
+        param($sender)
+        $data = $sender.Tag
+        $safePercent = [Math]::Max(0, [Math]::Min(100, [double]$data.Percent))
+        $data.Fill.Width = if ($safePercent -le 0) { 0 } else { [Math]::Max(4, $sender.ActualWidth * ($safePercent / 100)) }
+    })
+
+    return $row
+}
+
+function Set-CompactProgress($row, $percent, $enabled) {
+    $safePercent = [Math]::Max(0, [Math]::Min(100, [double]$percent))
+    $row.Percent = $safePercent
+    $accent = if ($enabled) { Get-LimitAccent $safePercent } else { "#6F7D85" }
+    $row.Fill.Background = Get-Brush $accent
+    $row.Fill.Width = if ($safePercent -le 0) { 0 } else { [Math]::Max(4, $row.Bar.ActualWidth * ($safePercent / 100)) }
+}
+
+function New-CompactStatusWindow($detailWindow) {
+    $compact = New-Object System.Windows.Window
+    $compact.Title = "Codex Usage Meter Compact"
+    $compact.Width = $script:CompactWidth
+    $compact.Height = $script:CompactHeight
+    $compact.MinWidth = $script:CompactWidth
+    $compact.MaxWidth = $script:CompactWidth
+    $compact.MinHeight = $script:CompactHeight
+    $compact.MaxHeight = $script:CompactHeight
+    $compact.WindowStyle = "None"
+    $compact.AllowsTransparency = $true
+    $compact.Background = [System.Windows.Media.Brushes]::Transparent
+    $compact.UseLayoutRounding = $true
+    $compact.SnapsToDevicePixels = $true
+    $compact.ResizeMode = "NoResize"
+    $compact.Topmost = $true
+    $compact.ShowInTaskbar = $false
+    Set-CompactWindowPlacement $compact $detailWindow
+
+    $outer = New-Object System.Windows.Controls.Border
+    $outer.Margin = "3"
+    $outer.Padding = "10,6,10,6"
+    $outer.CornerRadius = 10
+    $outer.BorderThickness = 1
+    $outer.BorderBrush = Get-Brush "#B8C7CF"
+    $outer.Background = Get-Brush "#EA1A2630"
+    $outer.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{
+        BlurRadius = 6
+        ShadowDepth = 0
+        Opacity = 0.16
+        Color = [System.Windows.Media.ColorConverter]::ConvertFromString("#02080E")
+    }
+
+    $root = New-Object System.Windows.Controls.Grid
+    $root.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
+    $root.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
+
+    $line = New-Object System.Windows.Controls.Grid
+    $line.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
+    $line.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    $line.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
+
+    $brand = New-TextBlock "Codex" 10 "SemiBold" "#F6FAFC"
+    $brand.Opacity = 0.72
+    $brand.Margin = "0,0,10,0"
+    $status = New-TextBlock "S --   W --" 12 "SemiBold" "#D6E2E8"
+    [System.Windows.Controls.Grid]::SetColumn($status, 1)
+    $time = New-TextBlock "--" 10 "Regular" "#C8D2D8"
+    $time.Margin = "10,1,0,0"
+    [System.Windows.Controls.Grid]::SetColumn($time, 2)
+    $line.Children.Add($brand) | Out-Null
+    $line.Children.Add($status) | Out-Null
+    $line.Children.Add($time) | Out-Null
+
+    $bars = New-Object System.Windows.Controls.Grid
+    $bars.Margin = "0,5,0,0"
+    $bars.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    $bars.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "8" }))
+    $bars.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    [System.Windows.Controls.Grid]::SetRow($bars, 1)
+
+    $sessionBar = New-CompactBar
+    $weeklyBar = New-CompactBar
+    [System.Windows.Controls.Grid]::SetColumn($weeklyBar.Bar, 2)
+    $bars.Children.Add($sessionBar.Bar) | Out-Null
+    $bars.Children.Add($weeklyBar.Bar) | Out-Null
+
+    $root.Children.Add($line) | Out-Null
+    $root.Children.Add($bars) | Out-Null
+    $outer.Child = $root
+    $compact.Content = $outer
+
+    $outer.Add_MouseLeftButtonDown({
+        param($sender, $event)
+        if ($event.ClickCount -ge 2) {
+            Show-UsageWindow $detailWindow
+        }
+    })
+
+    $compact.Show()
+
+    return [pscustomobject]@{
+        Window = $compact
+        Status = $status
+        Time = $time
+        SessionBar = $sessionBar
+        WeeklyBar = $weeklyBar
+    }
+}
+
+function Update-CompactStatus($compact, $usage, $activity) {
+    if (-not $compact) {
+        return
+    }
+
+    if (-not $usage.ok) {
+        $compact.Status.Text = "Waiting for limits"
+        $compact.Status.Foreground = Get-Brush "#D6E2E8"
+        $compact.Time.Text = "WAIT"
+        Set-CompactProgress $compact.SessionBar 0 $false
+        Set-CompactProgress $compact.WeeklyBar 0 $false
+        $compact.Window.ToolTip = Format-ActivityTooltip $null $activity
+        return
+    }
+
+    $sessionPercent = [Math]::Round([double]$usage.primary.used_percent)
+    $weeklyPercent = [Math]::Round([double]$usage.secondary.used_percent)
+    $compact.Status.Text = "S {0}%   W {1}%" -f $sessionPercent, $weeklyPercent
+    $compact.Status.Foreground = Get-Brush (Get-LimitAccent ([Math]::Max($sessionPercent, $weeklyPercent)))
+    $compact.Time.Text = Format-Remaining $usage.primary.resets_at
+    Set-CompactProgress $compact.SessionBar $sessionPercent $true
+    Set-CompactProgress $compact.WeeklyBar $weeklyPercent $true
+    $compact.Window.ToolTip = Format-ActivityTooltip $usage $activity
+}
+
 function Update-Widget($controls) {
     $usage = Get-CodexUsage
     $activity = Get-TokenActivitySummary
 
     if (-not $usage.ok) {
-        $controls.Plan.Text = "WAIT"
         Update-LimitRow $controls.Current $null "Waiting for Codex" "No fresh data"
         Update-LimitRow $controls.Weekly $null "Waiting for Codex" ""
+        Update-LimitRow $controls.MinimaxCurrent $null "Waiting for Minimax" ""
+        Update-LimitRow $controls.MinimaxWeekly $null "" ""
         $hint = Get-UsageHint $null $null $false
         $controls.Hint.Text = $hint.Text
         $controls.Hint.Foreground = Get-Brush $hint.Color
         $controls.Activity.Text = Format-ActivityText $null $activity
         $controls.Activity.ToolTip = Format-ActivityTooltip $null $activity
         $controls.Updated.Text = "Updated " + (Get-Date).ToString("HH:mm:ss")
+        Update-CompactStatus $controls.Compact $usage $activity
         return
     }
 
-    $plan = if ($usage.plan) { $usage.plan.ToString().ToUpperInvariant() } else { "PLAN" }
-    $controls.Plan.Text = $plan
     $currentReset = Format-BaliReset $usage.primary.resets_at
     $currentLeft = Format-Remaining $usage.primary.resets_at
     $weeklyReset = Format-LocalReset $usage.secondary.resets_at
     $weeklyLeft = Format-Remaining $usage.secondary.resets_at
     Update-LimitRow $controls.Current $usage.primary $currentReset $currentLeft
     Update-LimitRow $controls.Weekly $usage.secondary $weeklyReset $weeklyLeft
+
+    $minimax = Get-MinimaxUsage
+    if ($minimax.ok) {
+        $currentReset = Format-LocalReset $minimax.primary.resets_at
+        $currentLeft = Format-Remaining $minimax.primary.resets_at
+        $weeklyReset = Format-LocalReset $minimax.secondary.resets_at
+        $weeklyLeft = Format-Remaining $minimax.secondary.resets_at
+        Update-LimitRow $controls.MinimaxCurrent $minimax.primary $currentReset $currentLeft
+        Update-LimitRow $controls.MinimaxWeekly $minimax.secondary $weeklyReset $weeklyLeft
+    } else {
+        Update-LimitRow $controls.MinimaxCurrent $null "Waiting for Minimax" ""
+        Update-LimitRow $controls.MinimaxWeekly $null "" ""
+    }
+
     $hint = Get-UsageHint $usage.primary $usage.secondary $usage.isStale
     $controls.Hint.Text = $hint.Text
     $controls.Hint.Foreground = Get-Brush $hint.Color
     $controls.Activity.Text = Format-ActivityText $usage $activity
     $controls.Activity.ToolTip = Format-ActivityTooltip $usage $activity
     $controls.Updated.Text = "Updated " + $usage.updated.ToString("HH:mm:ss")
+    Update-CompactStatus $controls.Compact $usage $activity
 }
 
-function New-TrayIcon($window) {
+function New-TrayIcon($window, $compact) {
     $tray = New-Object System.Windows.Forms.NotifyIcon
     $tray.Text = "Codex Usage Meter"
     if (Test-Path $script:IconPath) {
@@ -1091,9 +1382,15 @@ function New-TrayIcon($window) {
 
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
     $showItem = New-Object System.Windows.Forms.ToolStripMenuItem "Show"
+    $compactItem = New-Object System.Windows.Forms.ToolStripMenuItem "Hide Compact Status"
+    $showCompactItem = New-Object System.Windows.Forms.ToolStripMenuItem "Show Compact Now"
+    $locateCompactItem = New-Object System.Windows.Forms.ToolStripMenuItem "Locate Compact Status"
     $dashboardItem = New-Object System.Windows.Forms.ToolStripMenuItem "Open Codex Usage Dashboard"
     $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem "Exit"
     $menu.Items.Add($showItem) | Out-Null
+    $menu.Items.Add($compactItem) | Out-Null
+    $menu.Items.Add($showCompactItem) | Out-Null
+    $menu.Items.Add($locateCompactItem) | Out-Null
     $menu.Items.Add($dashboardItem) | Out-Null
     $menu.Items.Add($exitItem) | Out-Null
     $tray.ContextMenuStrip = $menu
@@ -1104,6 +1401,49 @@ function New-TrayIcon($window) {
 
     $showItem.Add_Click($showAction)
     $tray.Add_DoubleClick($showAction)
+    $compactItem.Add_Click({
+        try {
+            if ($null -eq $compact -or $null -eq $compact.Window) {
+                return
+            }
+
+            if ($compact.Window.IsVisible) {
+                $compact.Window.Hide()
+            } else {
+                Set-CompactWindowPlacement $compact.Window $window
+                $compact.Window.Show()
+            }
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                ("Compact status toggle failed: {0}" -f $_.Exception.Message),
+                "Codex Usage Meter",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+        }
+    })
+    $showCompactItem.Add_Click({
+        if ($null -eq $compact -or $null -eq $compact.Window) {
+            return
+        }
+
+        Set-CompactWindowPlacement $compact.Window $window
+        $compact.Window.Show()
+        $compact.Window.Activate() | Out-Null
+    })
+    $locateCompactItem.Add_Click({
+        if ($null -eq $compact -or $null -eq $compact.Window) {
+            return
+        }
+
+        Show-CompactAtPrimaryBottom $compact.Window
+        [System.Windows.Forms.MessageBox]::Show(
+            ("Compact status at X={0}, Y={1}, W={2}, H={3}" -f [int]$compact.Window.Left, [int]$compact.Window.Top, [int]$compact.Window.Width, [int]$compact.Window.Height),
+            "Codex Usage Meter",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+    })
     $dashboardItem.Add_Click({
         [System.Diagnostics.Process]::Start($script:CodexUsageDashboardUrl) | Out-Null
     })
@@ -1143,9 +1483,9 @@ function Build-Widget {
     $window.ShowInTaskbar = $false
 
     $outer = New-Object System.Windows.Controls.Border
-    $outer.Margin = "8"
-    $outer.Padding = "18,14,18,7"
-    $outer.CornerRadius = 20
+    $outer.Margin = "6"
+    $outer.Padding = "12,10,12,4"
+    $outer.CornerRadius = 16
     $outer.BorderThickness = 1
     $outer.BorderBrush = Get-Brush "#AAB7BD"
     $outer.Background = Get-Brush "#E00E1821"
@@ -1158,52 +1498,78 @@ function Build-Widget {
 
     $root = New-Object System.Windows.Controls.Grid
     $root.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
-    $root.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
-
-    $headerPanel = New-Object System.Windows.Controls.StackPanel
-
-    $top = New-Object System.Windows.Controls.Grid
-    $top.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
-
-    $brand = New-Object System.Windows.Controls.StackPanel
-    $brand.Orientation = "Horizontal"
-    $name = New-TextBlock "Codex" 12 "SemiBold" "#F6FAFC"
-    $name.Opacity = 0.78
-    $plan = New-TextBlock "PLUS" 8.5 "SemiBold" "#D5DEE3"
-    $plan.Margin = "7,2,0,0"
-    $plan.Opacity = 0.6
-    $brand.Children.Add($name) | Out-Null
-    $brand.Children.Add($plan) | Out-Null
-    $top.Children.Add($brand) | Out-Null
-
-    $headerLine = New-Object System.Windows.Controls.Border
-    $headerLine.Height = 1
-    $headerLine.Margin = "0,8,0,0"
-    $headerLine.Background = Get-Brush "#D7E0E4"
-    $headerLine.Opacity = 0.13
-
-    $headerPanel.Children.Add($top) | Out-Null
-    $headerPanel.Children.Add($headerLine) | Out-Null
-    $root.Children.Add($headerPanel) | Out-Null
 
     $content = New-Object System.Windows.Controls.StackPanel
     $content.Margin = "0,0,0,0"
-    [System.Windows.Controls.Grid]::SetRow($content, 1)
+    [System.Windows.Controls.Grid]::SetRow($content, 0)
+
+    # Two column layout for Codex and Minimax side by side
+    $sectionsGrid = New-Object System.Windows.Controls.Grid
+    $sectionsGrid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    $sectionsGrid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "6" }))
+    $sectionsGrid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    $sectionsGrid.Margin = "0,0,0,4"
+
+    # Codex section with cyan border
+    $codexSection = New-Object System.Windows.Controls.Border
+    $codexSection.Margin = "0,0,0,0"
+    $codexSection.Padding = "0"
+    $codexSection.BorderThickness = 1
+    $codexSection.CornerRadius = 10
+    $codexSection.BorderBrush = Get-Brush "#6FE8FF"
+    $codexSection.BorderBrush.Opacity = 0.35
+    $codexSection.Background = [System.Windows.Media.Brushes]::Transparent
+
+    $codexInner = New-Object System.Windows.Controls.StackPanel
+    $codexInner.Margin = "10,6,10,6"
+
+    $codexLabel = New-TextBlock "CODEX" 9.5 "SemiBold" "#6FE8FF"
+    $codexLabel.Opacity = 0.85
 
     $current = New-LimitRow "CURRENT SESSION" $false 5
-    $weekly = New-LimitRow "WEEKLY LIMIT" $false 7
-    $content.Children.Add($current.panel) | Out-Null
+    $weekly = New-LimitRow "WEEKLY" $false 7
+    $codexInner.Children.Add($codexLabel) | Out-Null
+    $codexInner.Children.Add($current.panel) | Out-Null
+    $codexInner.Children.Add($weekly.panel) | Out-Null
 
-    $content.Children.Add((New-Hairline 9 0)) | Out-Null
-    $content.Children.Add($weekly.panel) | Out-Null
-    $content.Children.Add((New-Hairline 9 0)) | Out-Null
+    $codexSection.Child = $codexInner
+    [System.Windows.Controls.Grid]::SetColumn($codexSection, 0)
+    $sectionsGrid.Children.Add($codexSection) | Out-Null
+
+    # Minimax section with orange border
+    $minimaxSection = New-Object System.Windows.Controls.Border
+    $minimaxSection.Margin = "0,0,0,0"
+    $minimaxSection.Padding = "0"
+    $minimaxSection.BorderThickness = 1
+    $minimaxSection.CornerRadius = 10
+    $minimaxSection.BorderBrush = Get-Brush "#FF8A3D"
+    $minimaxSection.BorderBrush.Opacity = 0.35
+    $minimaxSection.Background = [System.Windows.Media.Brushes]::Transparent
+
+    $minimaxInner = New-Object System.Windows.Controls.StackPanel
+    $minimaxInner.Margin = "10,6,10,6"
+
+    $minimaxLabel = New-TextBlock "MINIMAX" 9.5 "SemiBold" "#FF8A3D"
+    $minimaxLabel.Opacity = 0.85
+
+    $minimaxCurrent = New-LimitRow "CURRENT SESSION" $false 5
+    $minimaxWeekly = New-LimitRow "WEEKLY" $false 7
+    $minimaxInner.Children.Add($minimaxLabel) | Out-Null
+    $minimaxInner.Children.Add($minimaxCurrent.panel) | Out-Null
+    $minimaxInner.Children.Add($minimaxWeekly.panel) | Out-Null
+
+    $minimaxSection.Child = $minimaxInner
+    [System.Windows.Controls.Grid]::SetColumn($minimaxSection, 2)
+    $sectionsGrid.Children.Add($minimaxSection) | Out-Null
+
+    $content.Children.Add($sectionsGrid) | Out-Null
 
     $activity = New-TextBlock "Last activity: waiting for token details" 9 "Regular" "#E2E9EC"
-    $activity.Margin = "0,7,0,0"
+    $activity.Margin = "0,4,0,0"
     $activity.Opacity = 0.74
 
     $hint = New-TextBlock "Usage pace looks balanced." 9.5 "Regular" "#D6E2E8"
-    $hint.Margin = "0,4,0,0"
+    $hint.Margin = "0,2,0,0"
     $hint.Opacity = 0.78
 
     $content.Children.Add($activity) | Out-Null
@@ -1216,16 +1582,20 @@ function Build-Widget {
     $outer.Child = $root
     $window.Content = $outer
 
+    $compact = New-CompactStatusWindow $window
+
     $controls = [pscustomobject]@{
-        Plan = $plan
         Current = $current
         Weekly = $weekly
+        MinimaxCurrent = $minimaxCurrent
+        MinimaxWeekly = $minimaxWeekly
         Activity = $activity
         Hint = $hint
         Updated = $updated
+        Compact = $compact
     }
 
-    $tray = New-TrayIcon $window
+    $tray = New-TrayIcon $window $compact
 
     $dragHandler = {
         param($sender, $event)
@@ -1247,9 +1617,15 @@ function Build-Widget {
 
     $window.Add_LocationChanged({
         Save-State $window
+        if ($null -ne $compact -and $null -ne $compact.Window -and $compact.Window.IsVisible) {
+            Set-CompactWindowPlacement $compact.Window $window
+        }
     })
     $window.Add_Closed({
         Save-State $window
+        if ($null -ne $compact -and $null -ne $compact.Window) {
+            $compact.Window.Close()
+        }
         if ($null -ne $tray) {
             $tray.Visible = $false
             $tray.Dispose()

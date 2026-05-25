@@ -1,6 +1,6 @@
 # Codex Usage Meter Agent Instructions
 
-This repository contains a Windows PowerShell + WPF tray-style widget for monitoring Codex usage limits.
+This repository contains a Windows PowerShell + WPF tray-style widget for monitoring Codex and Minimax usage limits.
 
 ## Project Context
 
@@ -12,40 +12,32 @@ This repository contains a Windows PowerShell + WPF tray-style widget for monito
 - User-facing docs: `README.md`
 - Local state: `usage-widget.state.json` is ignored by git and should remain local.
 
-## Current Behavior
+## Data Sources
 
 - Reads Codex telemetry from `%USERPROFILE%\.codex\sessions\**\*.jsonl`.
-- Uses only valid `rate_limits` events where `limit_id=codex` and both primary and secondary limits are populated.
-- Treats `primary` as the current 5-hour session limit.
-- Treats `secondary` as the weekly limit.
+- Uses only valid `rate_limits` events where `limit_id=codex` or `limit_id=minimax`.
+- Codex: `primary` = current 5-hour session, `secondary` = weekly limit.
+- Minimax: `primary` = daily limit, `secondary` = weekly limit.
 - Compares the latest usable rate-limit snapshot with the previous distinct snapshot to show last activity impact.
 - Reads local `token_count` and `task_started` events to estimate recent turn, latest call, and last-3-minute token usage.
-- Refreshes every 3 seconds.
-- Shows stale warning only after 15 minutes without a fresh Codex rate-limit event.
-- Ignores premium/null events.
-- Runs as a tray-only UI and does not show in the taskbar.
-- Double-clicking the panel hides the window.
-- Double-clicking the tray icon shows the window.
-- Tray menu contains `Show`, `Open Codex Usage Dashboard`, and `Exit`.
 
-## UI Notes
+## UI Layout
 
-- The UI is a single glassmorphic container.
-- Wordmark is `Codex PLUS` without a badge.
-- It has two blocks: `CURRENT SESSION` and `WEEKLY LIMIT`.
+- Widget height: 420px (increased from 276px to fit MINIMAX section)
+- Header shows "Codex PLUS | MINIMAX PRO" with brand-specific colors:
+  - Codex: cyan (#6FE8FF)
+  - MINIMAX: red-orange (#FF8A3D)
+- MINIMAX section in bordered container with orange border
+- Two blocks: `CURRENT SESSION` and `WEEKLY LIMIT` for Codex
+- One block: `MINIMAX DAILY` for Minimax
 - The main usage bar changes color by `used_percent`:
   - `0-49`: lime
   - `50-74`: yellow-green
   - `75-89`: amber
   - `90+`: orange
-- The lower time bar is segmented:
-  - current session: 5 sections / 4 ticks
-  - weekly limit: 7 sections / 6 ticks
-- Time bars fill left-to-right by elapsed time:
-  - filled = how much of the time window has passed
-  - empty right side = time remaining
-- Smart hints at the bottom analyze usage pace vs elapsed time and weekly pace.
-- Last-activity line shows recent limit movement and local token estimates; its tooltip can contain fuller token details.
+- Time bars fill left-to-right by elapsed time
+- Smart hints at the bottom analyze usage pace vs elapsed time and weekly pace
+- Compact last-activity line with token details in tooltip
 
 ## Recent Baseline Commits
 
