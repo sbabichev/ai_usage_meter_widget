@@ -4,7 +4,7 @@ Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:StatePath = Join-Path $script:AppDir "usage-widget.state.json"
@@ -16,6 +16,9 @@ $script:IconPath = Join-Path $script:AppDir "assets\codex-usage-meter.ico"
 $script:CodexUsageDashboardUrl = "https://chatgpt.com/codex/settings/usage"
 $script:WidgetWidth = 360
 $script:WidgetHeight = 450
+$script:CompactSingleWidth = 300
+$script:CompactDoubleWidth = 570
+$script:CompactHeight = 62
 $script:StaleAfterSeconds = 900
 $script:MinimaxDefaultRefreshSeconds = 300
 $script:MinimaxRemoteState = @{
@@ -25,6 +28,8 @@ $script:MinimaxRemoteState = @{
 }
 $script:CodexEnabled = $true
 $script:MinimaxEnabled = $true
+$script:CompactMode = $false
+$script:FullWidgetHeight = $script:WidgetHeight
 $script:UsageFloorState = @{
     WindowKey = ""
     PrimaryUsed = $null
@@ -127,7 +132,8 @@ function Get-FileTailLines($path, $maxBytes) {
                 }
             }
 
-            return @($text -split "`r?`n" | Where-Object { $_ })
+            $lineArray = $text.Split([char]10)
+            return @($lineArray | Where-Object { $_ })
         } finally {
             $stream.Dispose()
         }
@@ -160,6 +166,7 @@ function Read-State {
         topmost = $true
         opacity = 1.0
         refreshSeconds = 3
+        compactMode = $false
         usageFloor = $null
         providers = [ordered]@{
             codex = $true
@@ -230,7 +237,7 @@ function Read-Config {
     return $config
 }
 
-function Build-ProviderContextMenu($window, $codexSection, $minimaxSection) {
+function Build-ProviderContextMenu($window, $controls) {
     $menu = New-Object System.Windows.Controls.ContextMenu
 
     $codexItem = New-Object System.Windows.Controls.MenuItem
@@ -238,8 +245,11 @@ function Build-ProviderContextMenu($window, $codexSection, $minimaxSection) {
     $codexItem.IsCheckable = $true
     $codexItem.IsChecked = $script:CodexEnabled
     $codexItem.Add_Click({
+        if ($script:CodexEnabled -and -not $script:MinimaxEnabled) {
+            return
+        }
         $script:CodexEnabled = -not $script:CodexEnabled
-        Sync-ProviderVisibility $codexSection $minimaxSection
+        Sync-ProviderVisibility $controls
         Sync-ProviderState
     })
 
@@ -248,8 +258,11 @@ function Build-ProviderContextMenu($window, $codexSection, $minimaxSection) {
     $minimaxItem.IsCheckable = $true
     $minimaxItem.IsChecked = $script:MinimaxEnabled
     $minimaxItem.Add_Click({
+        if ($script:MinimaxEnabled -and -not $script:CodexEnabled) {
+            return
+        }
         $script:MinimaxEnabled = -not $script:MinimaxEnabled
-        Sync-ProviderVisibility $codexSection $minimaxSection
+        Sync-ProviderVisibility $controls
         Sync-ProviderState
     })
 
@@ -279,24 +292,57 @@ function Build-ProviderContextMenu($window, $codexSection, $minimaxSection) {
     return $menu
 }
 
-function Sync-ProviderVisibility($codexSection, $minimaxSection) {
+function Sync-ProviderVisibility($controls) {
+    $codexSection = $controls.CodexSection
+    $minimaxSection = $controls.MinimaxSection
+    $compactCodex = $controls.CompactCodex
+    $compactMinimax = $controls.CompactMinimax
+
+    if (-not $script:CodexEnabled -and -not $script:MinimaxEnabled) {
+        $script:CodexEnabled = $true
+    }
+
     if ($script:CodexEnabled) {
         $codexSection.Visibility = "Visible"
+        $compactCodex.panel.Visibility = "Visible"
     } else {
         $codexSection.Visibility = "Collapsed"
+        $compactCodex.panel.Visibility = "Collapsed"
     }
 
     if ($script:MinimaxEnabled) {
         $minimaxSection.Visibility = "Visible"
+        $compactMinimax.panel.Visibility = "Visible"
     } else {
         $minimaxSection.Visibility = "Collapsed"
+        $compactMinimax.panel.Visibility = "Collapsed"
     }
+
+    if ($script:CodexEnabled -and $script:MinimaxEnabled) {
+        $controls.CompactContent.ColumnDefinitions[0].Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        $controls.CompactContent.ColumnDefinitions[1].Width = [System.Windows.GridLength]::new(8)
+        $controls.CompactContent.ColumnDefinitions[2].Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        [System.Windows.Controls.Grid]::SetColumn($compactCodex.panel, 0)
+        [System.Windows.Controls.Grid]::SetColumn($compactMinimax.panel, 2)
+    } else {
+        $controls.CompactContent.ColumnDefinitions[0].Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        $controls.CompactContent.ColumnDefinitions[1].Width = [System.Windows.GridLength]::new(0)
+        $controls.CompactContent.ColumnDefinitions[2].Width = [System.Windows.GridLength]::new(0)
+        if ($script:CodexEnabled) {
+            [System.Windows.Controls.Grid]::SetColumn($compactCodex.panel, 0)
+        } else {
+            [System.Windows.Controls.Grid]::SetColumn($compactMinimax.panel, 0)
+        }
+    }
+
+    Set-WidgetMode $controls.Window $controls $script:CompactMode $false
 }
 
 function Sync-ProviderState {
     $state = Read-State
     $state.providers.codex = $script:CodexEnabled
     $state.providers.minimax = $script:MinimaxEnabled
+    $state | Add-Member -MemberType NoteProperty -Name compactMode -Value $script:CompactMode -Force
 
     $json = $state | ConvertTo-Json -Depth 4
     try {
@@ -313,6 +359,7 @@ function Save-State($window) {
             topmost = [bool]$window.Topmost
             opacity = 1.0
             refreshSeconds = 3
+            compactMode = $script:CompactMode
             usageFloor = [ordered]@{
                 windowKey = if ($script:UsageFloorState.WindowKey) { [string]$script:UsageFloorState.WindowKey } else { "" }
                 primaryUsed = if ($null -ne $script:UsageFloorState.PrimaryUsed) { [double]$script:UsageFloorState.PrimaryUsed } else { $null }
@@ -1761,6 +1808,168 @@ function New-LimitRow($title, $large, $timeSegments) {
     return $row
 }
 
+function Set-CompactProgress($panel, $percent) {
+    $safePercent = [Math]::Max(0, [Math]::Min(100, [double]$percent))
+    $panel.percent = $safePercent
+    $panel.fill.Width = if ($safePercent -le 0) { 0 } else { [Math]::Max(4, $panel.track.ActualWidth * ($safePercent / 100)) }
+}
+
+function Set-CompactAccent($panel, $usedPercent, $enabled) {
+    $accent = if ($enabled) { Get-LimitAccent $usedPercent } else { "#6F7D85" }
+    $panel.fill.Background = Get-Brush $accent
+    $panel.percentText.Foreground = Get-Brush $accent
+    if ($panel.fill.Effect) {
+        $panel.fill.Effect.Color = Get-Color $accent
+        $panel.fill.Effect.Opacity = if ($enabled) { 0.42 } else { 0.12 }
+    }
+}
+
+function Set-CompactWeeklyAccent($panel, $usedPercent, $enabled) {
+    $accent = if ($enabled) { Get-LimitAccent $usedPercent } else { "#6F7D85" }
+    $panel.weeklyText.Foreground = Get-Brush $accent
+}
+
+function New-CompactProviderPanel($name, $accentColor) {
+    $panelBorder = New-Object System.Windows.Controls.Border
+    $panelBorder.Padding = "9,4,9,4"
+    $panelBorder.BorderThickness = 1
+    $panelBorder.CornerRadius = 9
+    $panelBorder.BorderBrush = Get-Brush $accentColor
+    $panelBorder.BorderBrush.Opacity = 0.35
+    $panelBorder.Background = [System.Windows.Media.Brushes]::Transparent
+
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
+    $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
+    $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
+    $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
+    $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
+
+    $label = New-TextBlock $name 9.5 "SemiBold" $accentColor
+    $label.Opacity = 0.9
+    $label.VerticalAlignment = "Center"
+
+    $percentText = New-TextBlock "--" 16 "Light" "#A6FF4F"
+    $percentText.Margin = "10,-2,0,0"
+    $percentText.VerticalAlignment = "Center"
+    [System.Windows.Controls.Grid]::SetColumn($percentText, 1)
+
+    $timeText = New-TextBlock "--" 9.5 "Regular" "#D6E2E8"
+    $timeText.Margin = "10,1,0,0"
+    $timeText.Opacity = 0.74
+    $timeText.VerticalAlignment = "Center"
+    [System.Windows.Controls.Grid]::SetColumn($timeText, 2)
+
+    $weeklyText = New-TextBlock "W --" 9.5 "SemiBold" "#D6E2E8"
+    $weeklyText.Margin = "12,1,0,0"
+    $weeklyText.Opacity = 0.78
+    $weeklyText.VerticalAlignment = "Center"
+    [System.Windows.Controls.Grid]::SetColumn($weeklyText, 3)
+
+    $track = New-Object System.Windows.Controls.Border
+    $track.Height = 7
+    $track.CornerRadius = 3.5
+    $track.Background = Get-Brush "#5D7F4C"
+    $track.Opacity = 0.42
+
+    $fill = New-Object System.Windows.Controls.Border
+    $fill.Height = 7
+    $fill.CornerRadius = 3.5
+    $fill.HorizontalAlignment = "Left"
+    $fill.Background = Get-Brush "#A6FF4F"
+    $fill.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{
+        BlurRadius = 10
+        ShadowDepth = 0
+        Opacity = 0.42
+        Color = [System.Windows.Media.ColorConverter]::ConvertFromString("#A6FF4F")
+    }
+
+    $bar = New-Object System.Windows.Controls.Grid
+    $bar.Margin = "0,4,0,0"
+    $bar.Children.Add($track) | Out-Null
+    $bar.Children.Add($fill) | Out-Null
+    [System.Windows.Controls.Grid]::SetRow($bar, 1)
+    [System.Windows.Controls.Grid]::SetColumnSpan($bar, 4)
+
+    $grid.Children.Add($label) | Out-Null
+    $grid.Children.Add($percentText) | Out-Null
+    $grid.Children.Add($timeText) | Out-Null
+    $grid.Children.Add($weeklyText) | Out-Null
+    $grid.Children.Add($bar) | Out-Null
+
+    $panelBorder.Child = $grid
+
+    $panel = [pscustomobject]@{
+        panel = $panelBorder
+        label = $label
+        percentText = $percentText
+        timeText = $timeText
+        weeklyText = $weeklyText
+        track = $track
+        fill = $fill
+        percent = 0
+    }
+
+    $bar.Tag = $panel
+    $bar.Add_SizeChanged({
+        param($sender)
+        $data = $sender.Tag
+        Set-CompactProgress $data $data.percent
+    })
+
+    return $panel
+}
+
+function Format-CompactRemaining($resetSeconds) {
+    $text = Format-Remaining $resetSeconds
+    return $text -replace " left$", ""
+}
+
+function Format-CompactTooltip($name, $usage, $activity) {
+    if (-not $usage -or -not $usage.ok) {
+        return "{0}: waiting for telemetry" -f $name
+    }
+
+    $lines = @(
+        ("{0} current: {1:N0}% ({2})" -f $name, [double]$usage.primary.used_percent, (Format-Remaining $usage.primary.resets_at)),
+        ("{0} weekly: {1:N0}% ({2})" -f $name, [double]$usage.secondary.used_percent, (Format-Remaining $usage.secondary.resets_at))
+    )
+
+    if ($usage.isStale) {
+        $lines += "Telemetry may be stale."
+    }
+
+    if ($name -eq "Codex") {
+        $lines += Format-ActivityTooltip $usage $activity
+    }
+
+    return $lines -join [Environment]::NewLine
+}
+
+function Update-CompactProviderPanel($panel, $usage, $name, $activity) {
+    if (-not $usage -or -not $usage.ok -or -not $usage.primary) {
+        $panel.percentText.Text = "--"
+        $panel.timeText.Text = "waiting"
+        $panel.weeklyText.Text = "W --"
+        $panel.panel.ToolTip = "{0}: waiting for telemetry" -f $name
+        Set-CompactAccent $panel 0 $false
+        Set-CompactWeeklyAccent $panel 0 $false
+        Set-CompactProgress $panel 0
+        return
+    }
+
+    $percent = [Math]::Round([double]$usage.primary.used_percent)
+    $weeklyPercent = if ($usage.secondary) { [Math]::Round([double]$usage.secondary.used_percent) } else { $null }
+    $panel.percentText.Text = "$percent%"
+    $panel.timeText.Text = Format-CompactRemaining $usage.primary.resets_at
+    $panel.weeklyText.Text = if ($null -ne $weeklyPercent) { "W $weeklyPercent%" } else { "W --" }
+    $panel.panel.ToolTip = Format-CompactTooltip $name $usage $activity
+    Set-CompactAccent $panel $percent $true
+    Set-CompactWeeklyAccent $panel $weeklyPercent ($null -ne $weeklyPercent)
+    Set-CompactProgress $panel $percent
+}
+
 function Update-LimitRow($row, $limit, $resetText, $timeText) {
     if (-not $limit) {
         $row.value.Text = "--"
@@ -1774,6 +1983,7 @@ function Update-LimitRow($row, $limit, $resetText, $timeText) {
 
     $percent = [Math]::Round([double]$limit.used_percent)
     $row.value.Text = "%$percent"
+    $row.value.UpdateLayout()
     $row.reset.Text = $resetText
     $row.left.Text = $timeText
     Set-LimitAccent $row $percent $true
@@ -1785,6 +1995,99 @@ function Show-UsageWindow($window) {
     $window.Show()
     $window.WindowState = "Normal"
     $window.Activate() | Out-Null
+}
+
+function Get-VisibleProviderCount {
+    $count = 0
+    if ($script:CodexEnabled) { $count++ }
+    if ($script:MinimaxEnabled) { $count++ }
+    return [Math]::Max(1, $count)
+}
+
+function Get-FullWidgetHeight($controls) {
+    $availableWidth = [Math]::Max(1, $script:WidgetWidth - 36)
+    $controls.FullContent.Measure([System.Windows.Size]::new($availableWidth, [double]::PositiveInfinity))
+    $height = $controls.FullContent.DesiredSize.Height
+
+    if ($height -le 0) {
+        $controls.FullContent.UpdateLayout()
+        $height = $controls.FullContent.ActualHeight
+    }
+
+    if ($height -le 0) {
+        return $script:WidgetHeight
+    }
+
+    return [Math]::Max(120, [Math]::Min(600, [Math]::Ceiling($height + 28)))
+}
+
+function Move-WindowKeepingBottom($window, $oldBottom) {
+    if ($oldBottom -le 0) {
+        return
+    }
+
+    $newTop = $oldBottom - $window.Height
+    $workArea = [System.Windows.SystemParameters]::WorkArea
+    if ($newTop -lt $workArea.Top) {
+        $newTop = $workArea.Top
+    }
+
+    $maxTop = $workArea.Bottom - $window.Height
+    if ($newTop -gt $maxTop) {
+        $newTop = $maxTop
+    }
+
+    $window.Top = [Math]::Round($newTop)
+}
+
+function Set-WidgetMode($window, $controls, $compact, $saveState = $true, $preserveBottom = $false) {
+    $oldHeight = if ($window.ActualHeight -gt 0) { $window.ActualHeight } else { $window.Height }
+    $oldBottom = if ($preserveBottom) { $window.Top + $oldHeight } else { 0 }
+    $script:CompactMode = [bool]$compact
+
+    if ($script:CompactMode) {
+        $controls.FullContent.Visibility = "Collapsed"
+        $controls.CompactContent.Visibility = "Visible"
+        $controls.Outer.Padding = "8,4,8,4"
+        $controls.Outer.CornerRadius = 14
+
+        $width = if ((Get-VisibleProviderCount) -gt 1) { $script:CompactDoubleWidth } else { $script:CompactSingleWidth }
+        $window.SizeToContent = "Manual"
+        $window.Width = $width
+        $window.MinWidth = $width
+        $window.MaxWidth = $width
+        $window.Height = $script:CompactHeight
+        $window.MinHeight = $script:CompactHeight
+        $window.MaxHeight = $script:CompactHeight
+    } else {
+        $controls.CompactContent.Visibility = "Collapsed"
+        $controls.FullContent.Visibility = "Visible"
+        $controls.Outer.Padding = "12,10,12,4"
+        $controls.Outer.CornerRadius = 16
+
+        $window.SizeToContent = "Manual"
+        $window.Width = $script:WidgetWidth
+        $window.MinWidth = $script:WidgetWidth
+        $window.MaxWidth = $script:WidgetWidth
+        $height = Get-FullWidgetHeight $controls
+        $script:FullWidgetHeight = $height
+        $window.Height = $height
+        $window.MinHeight = $height
+        $window.MaxHeight = $height
+    }
+
+    if ($preserveBottom) {
+        Move-WindowKeepingBottom $window $oldBottom
+    }
+
+    if ($saveState) {
+        Save-State $window
+    }
+}
+
+function Toggle-WidgetMode($window, $controls) {
+    $wasCompact = $script:CompactMode
+    Set-WidgetMode $window $controls (-not $script:CompactMode) $true $wasCompact
 }
 
 function Update-Widget($controls) {
@@ -1801,6 +2104,8 @@ function Update-Widget($controls) {
         $controls.CodexHint.Foreground = Get-Brush $hint.Color
         $controls.CodexActivity.Text = Format-ActivityText $null $activity
         $controls.CodexActivity.ToolTip = Format-ActivityTooltip $null $activity
+        Update-CompactProviderPanel $controls.CompactCodex $null "Codex" $activity
+        Update-CompactProviderPanel $controls.CompactMinimax $null "MiniMax" $null
         $controls.Updated.Text = "Updated " + (Get-Date).ToString("HH:mm:ss")
         return
     }
@@ -1830,6 +2135,8 @@ function Update-Widget($controls) {
     $controls.CodexHint.Foreground = Get-Brush $hint.Color
     $controls.CodexActivity.Text = Format-ActivityText $usage $activity
     $controls.CodexActivity.ToolTip = Format-ActivityTooltip $usage $activity
+    Update-CompactProviderPanel $controls.CompactCodex $usage "Codex" $activity
+    Update-CompactProviderPanel $controls.CompactMinimax $minimax "MiniMax" $null
     $controls.Updated.Text = "Updated " + $usage.updated.ToString("HH:mm:ss")
 }
 
@@ -1857,7 +2164,6 @@ function New-TrayIcon($window) {
     }
 
     $showItem.Add_Click($showAction)
-    $tray.Add_DoubleClick($showAction)
     $dashboardItem.Add_Click({
         [System.Diagnostics.Process]::Start($script:CodexUsageDashboardUrl) | Out-Null
     })
@@ -1877,6 +2183,10 @@ function Build-Widget {
         $script:CodexEnabled = [bool]$state.providers.codex
         $script:MinimaxEnabled = [bool]$state.providers.minimax
     }
+    if (-not $script:CodexEnabled -and -not $script:MinimaxEnabled) {
+        $script:CodexEnabled = $true
+    }
+    $script:CompactMode = [bool](Get-ObjectValue $state "compactMode" $false)
 
     $window = New-Object System.Windows.Window
     $window.Title = "Codex Usage Meter"
@@ -1890,7 +2200,7 @@ function Build-Widget {
     $window.MaxWidth = $script:WidgetWidth
     $window.MinHeight = 200
     $window.MaxHeight = 600
-    $window.SizeToContent = "Height"
+    $window.SizeToContent = "Manual"
     $window.WindowStyle = "None"
     $window.AllowsTransparency = $true
     $window.Background = [System.Windows.Media.Brushes]::Transparent
@@ -1995,7 +2305,22 @@ function Build-Widget {
     $sectionsGrid.Children.Add($minimaxSection) | Out-Null
 
     $content.Children.Add($sectionsGrid) | Out-Null
+
+    $compactContent = New-Object System.Windows.Controls.Grid
+    $compactContent.Visibility = "Collapsed"
+    $compactContent.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    $compactContent.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "8" }))
+    $compactContent.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+
+    $compactCodex = New-CompactProviderPanel "CODEX" "#6FE8FF"
+    $compactMinimax = New-CompactProviderPanel "MINIMAX" "#FF8A3D"
+    [System.Windows.Controls.Grid]::SetColumn($compactCodex.panel, 0)
+    [System.Windows.Controls.Grid]::SetColumn($compactMinimax.panel, 2)
+    $compactContent.Children.Add($compactCodex.panel) | Out-Null
+    $compactContent.Children.Add($compactMinimax.panel) | Out-Null
+
     $root.Children.Add($content) | Out-Null
+    $root.Children.Add($compactContent) | Out-Null
 
     $updated = New-TextBlock "" 1 "Normal" "#AAB4BB"
     $updated.Visibility = "Collapsed"
@@ -2005,23 +2330,23 @@ function Build-Widget {
     $window.Visibility = "Visible"
 
     $root.Add_Loaded({
-        $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [action] {})
-        $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Layout, [action] {})
-        $height = [Math]::Max($outer.ActualHeight, $sectionsGrid.ActualHeight, $codexSection.ActualHeight, $minimaxSection.ActualHeight)
-        if ($height -gt 100) {
-            $window.Height = $height + 40
-            $window.MinHeight = $window.Height
-            $window.MaxHeight = $window.Height
-        }
-        Sync-ProviderVisibility $codexSection $minimaxSection
+        Sync-ProviderVisibility $controls
         Update-Widget $controls
     })
 
     $controls = [pscustomobject]@{
+        Window = $window
+        Outer = $outer
+        FullContent = $content
+        CompactContent = $compactContent
+        CodexSection = $codexSection
+        MinimaxSection = $minimaxSection
         Current = $current
         Weekly = $weekly
         MinimaxCurrent = $minimaxCurrent
         MinimaxWeekly = $minimaxWeekly
+        CompactCodex = $compactCodex
+        CompactMinimax = $compactMinimax
         CodexActivity = $codexActivity
         CodexHint = $codexHint
         Updated = $updated
@@ -2031,7 +2356,7 @@ function Build-Widget {
 
     $outer.Add_MouseRightButtonUp({
         param($sender, $event)
-        $menu = Build-ProviderContextMenu $window $codexSection $minimaxSection
+        $menu = Build-ProviderContextMenu $window $controls
 
         # Get mouse position in screen coordinates
         $mousePos = [System.Windows.Input.Mouse]::GetPosition($window)
@@ -2054,18 +2379,14 @@ function Build-Widget {
 
     $dragHandler = {
         param($sender, $event)
-        if (Test-IsInsideButton $event.OriginalSource) {
-            return
-        }
-
         if ($event.ClickCount -ge 2) {
-            Save-State $window
-            $window.Hide()
+            Toggle-WidgetMode $window $controls
+            $event.Handled = $true
             return
         }
 
         if ([System.Windows.Input.Mouse]::LeftButton -eq [System.Windows.Input.MouseButtonState]::Pressed) {
-            $window.DragMove()
+            try { $window.DragMove() } catch { }
         }
     }
     $outer.Add_MouseLeftButtonDown($dragHandler)
@@ -2078,14 +2399,6 @@ function Build-Widget {
         if ($null -ne $tray) {
             $tray.Visible = $false
             $tray.Dispose()
-        }
-    })
-
-    $window.Add_StateChanged({
-        if ($window.WindowState -eq [System.Windows.WindowState]::Minimized) {
-            Save-State $window
-            $window.Hide()
-            $window.WindowState = [System.Windows.WindowState]::Normal
         }
     })
 
