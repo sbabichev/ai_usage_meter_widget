@@ -1,5 +1,6 @@
 usage-widget.state.json
 usage-widget.local.json
+.claude/
 *.log
 .DS_Store
 Thumbs.db
