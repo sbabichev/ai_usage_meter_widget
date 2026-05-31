@@ -21,6 +21,7 @@ $script:CompactDoubleWidth = 570
 $script:CompactHeight = 62
 $script:StaleAfterSeconds = 900
 $script:MinimaxDefaultRefreshSeconds = 300
+$script:MinimaxTokenPlanUrl = "https://api.minimax.io/v1/token_plan/remains"
 $script:MinimaxRemoteState = @{
     LastFetch = $null
     Usage = $null
@@ -50,7 +51,7 @@ function Get-Color($hex) {
 }
 
 function Get-LimitAccent($usedPercent) {
-    $used = [Math]::Max(0, [Math]::Min(100, [double]$usedPercent))
+    $used = [Math]::Max([double]0, [Math]::Min([double]100, [double]$usedPercent))
     if ($used -ge 90) {
         return "#FF8A3D"
     }
@@ -458,7 +459,7 @@ function Get-TimeLeftPercent($limit) {
         return 0
     }
 
-    return [Math]::Max(0, [Math]::Min(100, ($remainingSeconds / $windowSeconds) * 100))
+    return [Math]::Max([double]0, [Math]::Min([double]100, ($remainingSeconds / $windowSeconds) * 100))
 }
 
 function Get-ElapsedPercent($limit) {
@@ -690,23 +691,41 @@ function Get-MinimaxRemoteSettings {
         $sshTarget = Get-FirstObjectValue $minimax @("sshTarget", "sshHost", "ssh")
     }
 
+    $authToken = Get-EnvValue "MINIMAX_QUOTA_TOKEN"
+    if (-not $authToken) {
+        $authToken = Get-EnvValue "MINIMAX_TOKEN_PLAN_KEY"
+    }
+    if (-not $authToken) {
+        $authToken = Get-EnvValue "MINIMAX_API_KEY"
+    }
+    if (-not $authToken) {
+        $authToken = Get-FirstObjectValue $minimax @("authToken", "token", "tokenPlanKey", "apiKey")
+    }
+
     if (-not $source) {
         if ($filePath) {
             $source = "file"
         } elseif ($sshCommand -or $sshTarget) {
             $source = "ssh"
+        } elseif ($authToken) {
+            $source = "token_plan"
         } else {
             $source = "http"
         }
     }
 
+    $normalizedSource = $source.ToString().ToLowerInvariant()
+    if (-not $url -and ($normalizedSource -in @("token_plan", "token-plan", "api"))) {
+        $url = $script:MinimaxTokenPlanUrl
+    }
+
     $enabledValue = Get-EnvValue "MINIMAX_QUOTA_ENABLED"
-    $envHasSource = ($envUrl -or $envFilePath -or $envSshCommand -or $envSshTarget)
+    $envHasSource = ($envUrl -or $envFilePath -or $envSshCommand -or $envSshTarget -or $authToken)
     if (-not $enabledValue -and -not $envHasSource) {
         $enabledValue = Get-ObjectValue $minimax "enabled" $null
     }
 
-    $hasSource = ($url -or $filePath -or $sshCommand -or $sshTarget)
+    $hasSource = ($url -or $filePath -or $sshCommand -or $sshTarget -or $authToken)
     $enabled = Convert-ToBoolean $enabledValue $hasSource
 
     $refreshSeconds = Convert-ToNullableNumber (Get-EnvValue "MINIMAX_QUOTA_REFRESH_SECONDS")
@@ -725,10 +744,6 @@ function Get-MinimaxRemoteSettings {
         $timeoutSeconds = 10
     }
 
-    $authToken = Get-EnvValue "MINIMAX_QUOTA_TOKEN"
-    if (-not $authToken) {
-        $authToken = Get-FirstObjectValue $minimax @("authToken", "token")
-    }
 
     $authHeaderName = Get-EnvValue "MINIMAX_QUOTA_AUTH_HEADER"
     if (-not $authHeaderName) {
@@ -762,9 +777,17 @@ function Get-MinimaxRemoteSettings {
         $sshRemoteCommand = "mmx quota --output json --non-interactive"
     }
 
+    $modelPattern = Get-EnvValue "MINIMAX_QUOTA_MODEL_PATTERN"
+    if (-not $modelPattern) {
+        $modelPattern = Get-FirstObjectValue $minimax @("modelPattern", "quotaModelPattern")
+    }
+    if (-not $modelPattern) {
+        $modelPattern = "MiniMax-M*"
+    }
+
     return [pscustomobject]@{
         Enabled = [bool]$enabled
-        Source = $source.ToString().ToLowerInvariant()
+        Source = $normalizedSource
         Url = if ($url) { $url.ToString() } else { "" }
         FilePath = if ($filePath) { $filePath.ToString() } else { "" }
         AuthToken = if ($authToken) { $authToken.ToString() } else { "" }
@@ -776,6 +799,7 @@ function Get-MinimaxRemoteSettings {
         SshPath = $sshPath.ToString()
         SshTarget = if ($sshTarget) { $sshTarget.ToString() } else { "" }
         SshRemoteCommand = $sshRemoteCommand.ToString()
+        ModelPattern = $modelPattern.ToString()
     }
 }
 
@@ -870,6 +894,15 @@ function Invoke-MinimaxQuotaRaw($settings) {
 
             return ([System.IO.File]::ReadAllText($settings.FilePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json)
         }
+        "token_plan" {
+            return Invoke-MinimaxHttpQuota $settings
+        }
+        "token-plan" {
+            return Invoke-MinimaxHttpQuota $settings
+        }
+        "api" {
+            return Invoke-MinimaxHttpQuota $settings
+        }
         default {
             return Invoke-MinimaxHttpQuota $settings
         }
@@ -905,6 +938,19 @@ function Convert-MinimaxTimestamp($value) {
     }
 }
 
+function Convert-MinimaxDurationSeconds($value, $defaultWindowMinutes) {
+    $number = Convert-ToNullableNumber $value
+    if ($null -eq $number -or $number -le 0) {
+        return $null
+    }
+
+    $windowSeconds = [Math]::Max(1, [double]$defaultWindowMinutes * 60)
+    if ($number -gt ($windowSeconds * 2)) {
+        return [double]$number / 1000
+    }
+
+    return [double]$number
+}
 function Get-MinimaxPayloadRoot($raw) {
     $current = $raw
     for ($index = 0; $index -lt 3; $index++) {
@@ -919,15 +965,27 @@ function Get-MinimaxPayloadRoot($raw) {
     return $current
 }
 
-function Get-MinimaxModelQuotaObject($root) {
+function Get-MinimaxModelQuotaObject($root, $modelPattern) {
     $items = Get-FirstObjectValue $root @("model_remains", "modelRemains", "models")
     if (-not $items) {
         return $null
     }
 
-    $usable = @($items) | Where-Object {
+    $usableItems = @($items) | Where-Object {
         (Get-FirstNumberValue $_ @("current_interval_total_count", "current_weekly_total_count", "total_count", "total")) -ne $null
-    } | Sort-Object {
+    }
+
+    if ($modelPattern) {
+        $matched = $usableItems | Where-Object {
+            $modelName = Get-FirstStringValue $_ @("model_name", "modelName", "name")
+            $modelName -and ($modelName -like $modelPattern)
+        }
+        if ($matched) {
+            $usableItems = $matched
+        }
+    }
+
+    $usable = $usableItems | Sort-Object {
         $total = Get-FirstNumberValue $_ @("current_interval_total_count", "current_weekly_total_count", "total_count", "total")
         if ($null -eq $total) { 0 } else { $total }
     } -Descending | Select-Object -First 1
@@ -993,7 +1051,7 @@ function Convert-MinimaxQuotaWindow($source, $prefix, $defaultWindowMinutes, $al
 
     $resetSeconds = Convert-MinimaxTimestamp (Get-FirstObjectValue $source $endNames)
     if ($resetSeconds -le 0) {
-        $durationSeconds = Get-FirstNumberValue $source $durationNames
+        $durationSeconds = Convert-MinimaxDurationSeconds (Get-FirstObjectValue $source $durationNames) $defaultWindowMinutes
         if ($null -ne $durationSeconds -and $durationSeconds -gt 0) {
             $resetSeconds = [DateTimeOffset]::Now.AddSeconds($durationSeconds).ToUnixTimeSeconds()
         }
@@ -1006,7 +1064,7 @@ function Convert-MinimaxQuotaWindow($source, $prefix, $defaultWindowMinutes, $al
     }
 
     return [pscustomobject]@{
-        used_percent = [Math]::Max(0, [Math]::Min(100, [double]$percent))
+        used_percent = [Math]::Max([double]0, [Math]::Min([double]100, [double]$percent))
         resets_at = $resetSeconds
         window_minutes = $defaultWindowMinutes
         total = if ($null -ne $total) { [double]$total } else { $null }
@@ -1015,9 +1073,9 @@ function Convert-MinimaxQuotaWindow($source, $prefix, $defaultWindowMinutes, $al
     }
 }
 
-function Convert-MinimaxQuota($raw, $sourceName) {
+function Convert-MinimaxQuota($raw, $sourceName, $modelPattern = "MiniMax-M*") {
     $root = Get-MinimaxPayloadRoot $raw
-    $model = Get-MinimaxModelQuotaObject $root
+    $model = Get-MinimaxModelQuotaObject $root $modelPattern
     $primarySource = if ($model) { $model } else { $root }
 
     $intervalSource = Get-FirstObjectValue $root @("interval", "current_interval", "session", "five_hour", "rolling_interval")
@@ -1590,7 +1648,7 @@ function Get-MinimaxUsage {
 
     try {
         $raw = Invoke-MinimaxQuotaRaw $settings
-        $usage = Convert-MinimaxQuota $raw $settings.Source
+        $usage = Convert-MinimaxQuota $raw $settings.Source $settings.ModelPattern
         $script:MinimaxRemoteState.LastFetch = $now
         $script:MinimaxRemoteState.Usage = $usage
         $script:MinimaxRemoteState.Error = $null
@@ -1620,13 +1678,13 @@ function Get-MinimaxUsage {
 }
 
 function Set-Progress($row, $percent) {
-    $safePercent = [Math]::Max(0, [Math]::Min(100, [double]$percent))
+    $safePercent = [Math]::Max([double]0, [Math]::Min([double]100, [double]$percent))
     $row.percent = $safePercent
-    $row.fill.Width = [Math]::Max(5, $row.track.ActualWidth * ($safePercent / 100))
+    $row.fill.Width = [Math]::Max([double]5, $row.track.ActualWidth * ($safePercent / 100))
 }
 
 function Set-TimeProgress($row, $percent) {
-    $safePercent = [Math]::Max(0, [Math]::Min(100, [double]$percent))
+    $safePercent = [Math]::Max([double]0, [Math]::Min([double]100, [double]$percent))
     $elapsedPercent = 100 - $safePercent
     $row.timePercent = $safePercent
     $accent = if ($elapsedPercent -ge 88) {
@@ -1809,7 +1867,7 @@ function New-LimitRow($title, $large, $timeSegments) {
 }
 
 function Set-CompactProgress($panel, $percent) {
-    $safePercent = [Math]::Max(0, [Math]::Min(100, [double]$percent))
+    $safePercent = [Math]::Max([double]0, [Math]::Min([double]100, [double]$percent))
     $panel.percent = $safePercent
     $panel.fill.Width = if ($safePercent -le 0) { 0 } else { [Math]::Max(4, $panel.track.ActualWidth * ($safePercent / 100)) }
 }

@@ -32,7 +32,9 @@
                },
     "minimax":  {
                     "enabled":  false,
-                    "source":  "ssh",
+                    "source":  "token_plan",
+                    "url":  "https://api.minimax.io/v1/token_plan/remains",
+                    "modelPattern":  "MiniMax-M*",
                     "sshTarget":  "",
                     "sshRemoteCommand":  "mmx quota --output json --non-interactive",
                     "refreshSeconds":  300,

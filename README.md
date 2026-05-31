@@ -59,7 +59,7 @@ The widget refreshes every 3 seconds and ignores non-Codex or incomplete rate-li
 
 ## MiniMax Limits
 
-MiniMax quota fetching is configured through `usage-widget.config.json`, ignored `usage-widget.local.json`, or environment variables. Prefer `usage-widget.local.json` for machine-specific SSH aliases and secrets.
+MiniMax quota fetching is configured through `usage-widget.config.json`, ignored `usage-widget.local.json`, or environment variables. Prefer `usage-widget.local.json` for machine-specific API tokens, SSH aliases, and secrets.
 
 Example local config:
 
@@ -67,16 +67,16 @@ Example local config:
 {
   "minimax": {
     "enabled": true,
-    "source": "ssh",
-    "sshTarget": "contabo",
-    "sshRemoteCommand": "/home/jarvis/.npm-global/bin/mmx quota --output json --non-interactive",
+    "source": "token_plan",
+    "tokenPlanKey": "YOUR_TOKEN_PLAN_KEY",
+    "modelPattern": "MiniMax-M*",
     "refreshSeconds": 300,
     "timeoutSeconds": 10
   }
 }
 ```
 
-The widget treats `current_interval_usage_count` and `current_weekly_usage_count` as used counts and calculates usage as `usage_count / total`.
+For `source: "token_plan"`, the widget calls `GET https://api.minimax.io/v1/token_plan/remains` with `Authorization: Bearer ...`, reads `model_remains`, and prefers the `model_name` matching `MiniMax-M*` for text-generation quota. It treats `current_interval_usage_count` and `current_weekly_usage_count` as used counts and calculates usage as `usage_count / total`; `end_time` and `weekly_end_time` are treated as millisecond reset timestamps. Use `modelPattern: "speech-hd"` if you want to show TTS instead.
 
 ## Controls
 
