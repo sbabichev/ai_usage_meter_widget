@@ -27,9 +27,17 @@ public static class NativeWindowTools {
         int cx,
         int cy,
         UInt32 uFlags);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 }
 "@
 }
+
+[NativeWindowTools]::ShowWindow([NativeWindowTools]::GetConsoleWindow(), 0) | Out-Null
 
 $ErrorActionPreference = "Continue"
 
@@ -43,8 +51,8 @@ $script:IconPath = Join-Path $script:AppDir "assets\codex-usage-meter.ico"
 $script:CodexUsageDashboardUrl = "https://chatgpt.com/codex/settings/usage"
 $script:WidgetWidth = 360
 $script:WidgetHeight = 450
-$script:CompactSingleWidth = 300
-$script:CompactDoubleWidth = 570
+$script:CompactSingleWidth = 270
+$script:CompactDoubleWidth = 520
 $script:CompactHeight = 62
 $script:StaleAfterSeconds = 900
 $script:MinimaxDefaultRefreshSeconds = 300
