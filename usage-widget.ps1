@@ -47,6 +47,7 @@ $script:ConfigPath = Join-Path $script:AppDir "usage-widget.config.json"
 $script:LocalConfigPath = Join-Path $script:AppDir "usage-widget.local.json"
 $script:LogPath = Join-Path $script:AppDir "usage-widget.log"
 $script:CodexSessionsDir = Join-Path $env:USERPROFILE ".codex\sessions"
+$script:CodexLogsPath = Join-Path $env:USERPROFILE ".codex\logs_2.sqlite"
 $script:IconPath = Join-Path $script:AppDir "assets\codex-usage-meter.ico"
 $script:CodexUsageDashboardUrl = "https://chatgpt.com/codex/settings/usage"
 $script:WidgetWidth = 360
@@ -55,6 +56,7 @@ $script:CompactSingleWidth = 270
 $script:CompactDoubleWidth = 520
 $script:CompactHeight = 62
 $script:StaleAfterSeconds = 900
+$script:ResetDriftToleranceSeconds = 120
 $script:MinimaxDefaultRefreshSeconds = 300
 $script:MinimaxTokenPlanUrl = "https://api.minimax.io/v1/token_plan/remains"
 $script:MinimaxRemoteState = @{
@@ -69,6 +71,8 @@ $script:TopmostEnabled = $true
 $script:UsageSnapshot = $null
 $script:StartupRefreshTimer = $null
 $script:CompactTopmostTimer = $null
+$script:CodexSessionChangeTimer = $null
+$script:CodexLastSessionChangeKey = ""
 $script:FullWidgetHeight = $script:WidgetHeight
 $script:UsageFloorState = @{
     WindowKey = ""
@@ -180,6 +184,77 @@ function Get-FileTailLines($path, $maxBytes) {
     } catch {
         return @()
     }
+}
+
+function Get-FileTailText($path, $maxBytes) {
+    try {
+        $stream = [System.IO.File]::Open(
+            $path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        try {
+            $length = $stream.Length
+            $bytesToRead = [Math]::Min([int64]$maxBytes, $length)
+            $offset = $length - $bytesToRead
+            $stream.Seek($offset, [System.IO.SeekOrigin]::Begin) | Out-Null
+
+            $buffer = New-Object byte[] ([int]$bytesToRead)
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) {
+                return ""
+            }
+
+            return [System.Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {
+        return ""
+    }
+}
+
+function Get-BalancedJsonFromText($text, $startIndex) {
+    if ([string]::IsNullOrEmpty($text) -or $startIndex -lt 0 -or $startIndex -ge $text.Length) {
+        return $null
+    }
+
+    $depth = 0
+    $inString = $false
+    $escaped = $false
+    for ($i = $startIndex; $i -lt $text.Length; $i++) {
+        $ch = $text[$i]
+        if ($escaped) {
+            $escaped = $false
+            continue
+        }
+
+        if ($ch -eq '\') {
+            $escaped = $true
+            continue
+        }
+
+        if ($ch -eq '"') {
+            $inString = -not $inString
+            continue
+        }
+
+        if ($inString) {
+            continue
+        }
+
+        if ($ch -eq "{") {
+            $depth++
+        } elseif ($ch -eq "}") {
+            $depth--
+            if ($depth -eq 0) {
+                return $text.Substring($startIndex, $i - $startIndex + 1)
+            }
+        }
+    }
+
+    return $null
 }
 
 function Test-IsInsideButton($source) {
@@ -583,6 +658,7 @@ function New-UsageObjectSnapshot($usage) {
         message = Get-ObjectValue $usage "message" $null
         plan = Get-ObjectValue $usage "plan" $null
         source = Get-ObjectValue $usage "source" $null
+        limitReachedType = Get-ObjectValue $usage "limitReachedType" $null
         updated = $updated.ToString("o")
         isStale = [bool](Get-ObjectValue $usage "isStale" $false)
         staleText = Get-ObjectValue $usage "staleText" ""
@@ -612,6 +688,7 @@ function Restore-UsageObjectSnapshot($snapshot) {
         message = Get-ObjectValue $snapshot "message" $null
         plan = Get-ObjectValue $snapshot "plan" $null
         source = Get-ObjectValue $snapshot "source" $null
+        limitReachedType = Get-ObjectValue $snapshot "limitReachedType" $null
         updated = $updated
         isStale = [bool](Get-ObjectValue $snapshot "isStale" $false)
         staleText = Get-ObjectValue $snapshot "staleText" ""
@@ -747,18 +824,18 @@ function Get-ElapsedPercent($limit) {
     return 100 - (Get-TimeLeftPercent $limit)
 }
 
-function Get-UsageHint($primary, $secondary, $isStale) {
-    if ($isStale) {
-        return [pscustomobject]@{
-            Text = "Telemetry paused. Values may lag until Codex reports again."
-            Color = "#FFC857"
-        }
-    }
-
+function Get-UsageHint($primary, $secondary, $isStale, $limitReachedType = $null) {
     if (-not $primary -or -not $secondary) {
         return [pscustomobject]@{
             Text = "Waiting for fresh Codex limit telemetry."
             Color = "#D6E2E8"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($limitReachedType)) {
+        return [pscustomobject]@{
+            Text = "Codex reports a limit is reached. Wait for reset or switch models."
+            Color = "#FF8A3D"
         }
     }
 
@@ -768,6 +845,19 @@ function Get-UsageHint($primary, $secondary, $isStale) {
     $weeklyElapsed = Get-ElapsedPercent $secondary
     $sessionDelta = $sessionUsed - $sessionElapsed
     $weeklyDelta = $weeklyUsed - $weeklyElapsed
+
+    if ($isStale) {
+        $text = if ($sessionUsed -ge 85 -or $weeklyUsed -ge 85) {
+            "Telemetry paused near the cap. Limit may already be exhausted."
+        } else {
+            "Telemetry paused. Values may lag until Codex reports again."
+        }
+
+        return [pscustomobject]@{
+            Text = $text
+            Color = "#FFC857"
+        }
+    }
 
     if ($sessionUsed -ge 92) {
         return [pscustomobject]@{
@@ -1480,6 +1570,133 @@ function Format-PercentDelta($value) {
     return $sign + $rounded.ToString("0.0", [Globalization.CultureInfo]::InvariantCulture) + "%"
 }
 
+function Get-RateLimitWindowKey($primaryReset, $secondaryReset) {
+    return "{0}:{1}" -f (Convert-ToInt64 $primaryReset), (Convert-ToInt64 $secondaryReset)
+}
+
+function Test-ResetTimesMatch($left, $right) {
+    return [Math]::Abs((Convert-ToInt64 $left) - (Convert-ToInt64 $right)) -le $script:ResetDriftToleranceSeconds
+}
+
+function Test-RateLimitWindowMatches($leftPrimaryReset, $leftSecondaryReset, $rightPrimaryReset, $rightSecondaryReset) {
+    return (Test-ResetTimesMatch $leftPrimaryReset $rightPrimaryReset) -and
+        (Test-ResetTimesMatch $leftSecondaryReset $rightSecondaryReset)
+}
+
+function Test-RateLimitWindowKeyMatches($windowKey, $primaryReset, $secondaryReset) {
+    if ([string]::IsNullOrWhiteSpace($windowKey)) {
+        return $false
+    }
+
+    $parts = $windowKey.Split(":")
+    if ($parts.Count -ne 2) {
+        return $false
+    }
+
+    return Test-RateLimitWindowMatches $parts[0] $parts[1] $primaryReset $secondaryReset
+}
+
+function Convert-CodexLogRateLimitEvent($event) {
+    if (-not $event -or $event.type -ne "codex.rate_limits" -or -not $event.rate_limits) {
+        return $null
+    }
+
+    $limits = $event.rate_limits
+    if (-not $limits.primary -or -not $limits.secondary) {
+        return $null
+    }
+
+    $primaryReset = Convert-ToInt64 (Get-ObjectValue $limits.primary "reset_at" 0)
+    $secondaryReset = Convert-ToInt64 (Get-ObjectValue $limits.secondary "reset_at" 0)
+    $primaryResetAfter = Convert-ToInt64 (Get-ObjectValue $limits.primary "reset_after_seconds" 0)
+    $stampSeconds = if ($primaryReset -gt 0 -and $primaryResetAfter -gt 0) {
+        $primaryReset - $primaryResetAfter
+    } else {
+        [DateTimeOffset]::Now.ToUnixTimeSeconds()
+    }
+
+    $reachedType = $null
+    if ([bool](Get-ObjectValue $limits "limit_reached" $false)) {
+        $reachedType = "primary"
+    }
+
+    $rateLimits = [pscustomobject]@{
+        limit_id = "codex"
+        limit_name = $null
+        primary = [pscustomobject]@{
+            used_percent = Convert-ToNumber (Get-ObjectValue $limits.primary "used_percent" 0)
+            window_minutes = Convert-ToInt64 (Get-ObjectValue $limits.primary "window_minutes" 0)
+            resets_at = $primaryReset
+        }
+        secondary = [pscustomobject]@{
+            used_percent = Convert-ToNumber (Get-ObjectValue $limits.secondary "used_percent" 0)
+            window_minutes = Convert-ToInt64 (Get-ObjectValue $limits.secondary "window_minutes" 0)
+            resets_at = $secondaryReset
+        }
+        credits = Get-ObjectValue $event "credits" $null
+        plan_type = Get-ObjectValue $event "plan_type" $null
+        rate_limit_reached_type = $reachedType
+    }
+
+    return [pscustomobject]@{
+        Stamp = [DateTimeOffset]::FromUnixTimeSeconds($stampSeconds)
+        Event = [pscustomobject]@{
+            timestamp = ([DateTimeOffset]::FromUnixTimeSeconds($stampSeconds)).ToString("o")
+            payload = [pscustomobject]@{
+                type = "token_count"
+                rate_limits = $rateLimits
+            }
+        }
+        File = $script:CodexLogsPath
+        PrimaryUsed = Convert-ToNumber $rateLimits.primary.used_percent
+        SecondaryUsed = Convert-ToNumber $rateLimits.secondary.used_percent
+        PrimaryReset = Convert-ToInt64 $rateLimits.primary.resets_at
+        SecondaryReset = Convert-ToInt64 $rateLimits.secondary.resets_at
+        RateLimitReachedType = $reachedType
+    }
+}
+
+function Get-CodexLogRateLimitSnapshot {
+    $paths = @($script:CodexLogsPath + "-wal", $script:CodexLogsPath)
+    $snapshots = @()
+    foreach ($path in $paths) {
+        if (-not (Test-Path $path)) {
+            continue
+        }
+
+        $text = Get-FileTailText $path (8 * 1024 * 1024)
+        if ([string]::IsNullOrEmpty($text)) {
+            continue
+        }
+
+        $needle = '{"type":"codex.rate_limits"'
+        $index = 0
+        while ($true) {
+            $found = $text.IndexOf($needle, $index, [StringComparison]::Ordinal)
+            if ($found -lt 0) {
+                break
+            }
+
+            $json = Get-BalancedJsonFromText $text $found
+            if ($json) {
+                try {
+                    $snapshot = Convert-CodexLogRateLimitEvent ($json | ConvertFrom-Json)
+                    if ($snapshot) {
+                        $snapshots += $snapshot
+                    }
+                } catch {
+                }
+            }
+
+            $index = $found + $needle.Length
+        }
+    }
+
+    return $snapshots |
+        Sort-Object Stamp -Descending |
+        Select-Object -First 1
+}
+
 function Test-UsableCodexRateLimits($limits) {
     if (-not $limits) {
         return $false
@@ -1555,10 +1772,18 @@ function Get-RateLimitHistory($limitId = "codex") {
                     SecondaryUsed = Convert-ToNumber $limits.secondary.used_percent
                     PrimaryReset = Convert-ToInt64 $limits.primary.resets_at
                     SecondaryReset = Convert-ToInt64 $limits.secondary.resets_at
+                    RateLimitReachedType = Get-ObjectValue $limits "rate_limit_reached_type" $null
                 }
             } catch {
                 continue
             }
+        }
+    }
+
+    if ($limitId -eq "codex") {
+        $logSnapshot = Get-CodexLogRateLimitSnapshot
+        if ($logSnapshot) {
+            $snapshots += $logSnapshot
         }
     }
 
@@ -1569,11 +1794,14 @@ function Get-RateLimitHistory($limitId = "codex") {
     }
 
     $sameWindow = $sorted | Where-Object {
-        ($_.PrimaryReset -eq $latest.PrimaryReset) -and
-        ($_.SecondaryReset -eq $latest.SecondaryReset)
+        Test-RateLimitWindowMatches $_.PrimaryReset $_.SecondaryReset $latest.PrimaryReset $latest.SecondaryReset
     }
     $windowPrimaryMax = ($sameWindow | Measure-Object -Property PrimaryUsed -Maximum).Maximum
     $windowSecondaryMax = ($sameWindow | Measure-Object -Property SecondaryUsed -Maximum).Maximum
+    $reachedType = $sameWindow |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_.RateLimitReachedType) } |
+        Sort-Object Stamp -Descending |
+        Select-Object -First 1 -ExpandProperty RateLimitReachedType
 
     if ($null -eq $windowPrimaryMax) {
         $windowPrimaryMax = $latest.PrimaryUsed
@@ -1590,6 +1818,9 @@ function Get-RateLimitHistory($limitId = "codex") {
     if ($windowSecondaryMax -gt $latest.SecondaryUsed) {
         $latest.SecondaryUsed = $windowSecondaryMax
         $latest.Event.payload.rate_limits.secondary.used_percent = $windowSecondaryMax
+    }
+    if (-not [string]::IsNullOrWhiteSpace($reachedType)) {
+        $latest.Event.payload.rate_limits.rate_limit_reached_type = $reachedType
     }
 
     $previous = $sorted |
@@ -1611,11 +1842,11 @@ function Apply-UsageFloor($limits) {
         return
     }
 
-    $windowKey = "{0}:{1}" -f (Convert-ToInt64 $limits.primary.resets_at), (Convert-ToInt64 $limits.secondary.resets_at)
+    $windowKey = Get-RateLimitWindowKey $limits.primary.resets_at $limits.secondary.resets_at
     $primaryCurrent = Convert-ToNumber $limits.primary.used_percent
     $secondaryCurrent = Convert-ToNumber $limits.secondary.used_percent
 
-    if ($script:UsageFloorState.WindowKey -ne $windowKey) {
+    if (-not (Test-RateLimitWindowKeyMatches $script:UsageFloorState.WindowKey $limits.primary.resets_at $limits.secondary.resets_at)) {
         $script:UsageFloorState.WindowKey = $windowKey
         $script:UsageFloorState.PrimaryUsed = $primaryCurrent
         $script:UsageFloorState.SecondaryUsed = $secondaryCurrent
@@ -1635,6 +1866,25 @@ function Apply-UsageFloor($limits) {
 
     $limits.primary.used_percent = $script:UsageFloorState.PrimaryUsed
     $limits.secondary.used_percent = $script:UsageFloorState.SecondaryUsed
+}
+
+function Apply-CodexRateLimitReached($limits) {
+    if (-not $limits -or -not $limits.primary -or -not $limits.secondary) {
+        return
+    }
+
+    $reachedType = Get-ObjectValue $limits "rate_limit_reached_type" $null
+    if ([string]::IsNullOrWhiteSpace($reachedType)) {
+        return
+    }
+
+    $text = $reachedType.ToString().ToLowerInvariant()
+    if ($text -match "secondary|weekly|week") {
+        $limits.secondary.used_percent = 100
+        return
+    }
+
+    $limits.primary.used_percent = 100
 }
 
 function Get-TokenActivitySummary {
@@ -1855,6 +2105,7 @@ function Get-CodexUsage {
     $previous = $history.PreviousDistinct
     $limits = $latest.Event.payload.rate_limits
     Apply-UsageFloor $limits
+    Apply-CodexRateLimitReached $limits
     $age = (Get-Date) - $latest.Stamp.LocalDateTime
     $primaryDelta = if ($previous) { $latest.PrimaryUsed - $previous.PrimaryUsed } else { $null }
     $secondaryDelta = if ($previous) { $latest.SecondaryUsed - $previous.SecondaryUsed } else { $null }
@@ -1862,6 +2113,7 @@ function Get-CodexUsage {
         ok = $true
         message = $null
         plan = $limits.plan_type
+        limitReachedType = Get-ObjectValue $limits "rate_limit_reached_type" $null
         updated = $latest.Stamp.LocalDateTime
         isStale = ($age.TotalSeconds -gt $script:StaleAfterSeconds)
         staleText = if ($age.TotalSeconds -gt $script:StaleAfterSeconds) { "Updated {0}m ago" -f [Math]::Max(1, [Math]::Floor($age.TotalMinutes)) } else { "" }
@@ -1879,11 +2131,11 @@ function Apply-MinimaxFloor($limits) {
         return
     }
 
-    $windowKey = "{0}:{1}" -f (Convert-ToInt64 $limits.primary.resets_at), (Convert-ToInt64 $limits.secondary.resets_at)
+    $windowKey = Get-RateLimitWindowKey $limits.primary.resets_at $limits.secondary.resets_at
     $primaryCurrent = Convert-ToNumber $limits.primary.used_percent
     $secondaryCurrent = Convert-ToNumber $limits.secondary.used_percent
 
-    if ($script:MinimaxFloorState.WindowKey -ne $windowKey) {
+    if (-not (Test-RateLimitWindowKeyMatches $script:MinimaxFloorState.WindowKey $limits.primary.resets_at $limits.secondary.resets_at)) {
         $script:MinimaxFloorState.WindowKey = $windowKey
         $script:MinimaxFloorState.PrimaryUsed = $primaryCurrent
         $script:MinimaxFloorState.SecondaryUsed = $secondaryCurrent
@@ -2470,7 +2722,7 @@ function Apply-WidgetData($controls, $usage, $minimax, $activity) {
         Update-LimitRow $controls.Current $usage.primary $currentReset $currentLeft
         Update-LimitRow $controls.Weekly $usage.secondary $weeklyReset $weeklyLeft
 
-        $hint = Get-UsageHint $usage.primary $usage.secondary $usage.isStale
+        $hint = Get-UsageHint $usage.primary $usage.secondary $usage.isStale $usage.limitReachedType
         $controls.CodexHint.Text = $hint.Text
         $controls.CodexHint.Foreground = Get-Brush $hint.Color
         $controls.CodexActivity.Text = Format-ActivityText $usage $activity
@@ -2521,6 +2773,71 @@ function Update-Widget($controls) {
         $script:UsageSnapshot = New-UsageSnapshot $usage $minimax $activity
         Save-State $controls.Window
     }
+}
+
+function Get-CodexSessionChangeKey {
+    try {
+        $parts = @()
+        if (Test-Path $script:CodexSessionsDir) {
+            $files = Get-ChildItem -Path $script:CodexSessionsDir -Recurse -Filter *.jsonl -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 3
+            $parts += @($files | ForEach-Object {
+                "{0}|{1}|{2}" -f $_.FullName, $_.LastWriteTimeUtc.Ticks, $_.Length
+            })
+        }
+
+        foreach ($path in @($script:CodexLogsPath, $script:CodexLogsPath + "-wal")) {
+            if (Test-Path $path) {
+                $item = Get-Item $path -ErrorAction SilentlyContinue
+                if ($item) {
+                    $parts += "{0}|{1}|{2}" -f $item.FullName, $item.LastWriteTimeUtc.Ticks, $item.Length
+                }
+            }
+        }
+
+        if ($parts.Count -eq 0) {
+            return ""
+        }
+
+        return ($parts -join ";")
+    } catch {
+        return ""
+    }
+}
+
+function Start-CodexSessionWatcher($controls) {
+    if (-not $controls) {
+        return
+    }
+
+    if ($null -ne $script:CodexSessionChangeTimer) {
+        return
+    }
+
+    $script:CodexLastSessionChangeKey = Get-CodexSessionChangeKey
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(700)
+    $timer.Tag = $controls
+    $timer.Add_Tick({
+        param($sender)
+        $currentKey = Get-CodexSessionChangeKey
+        if ($currentKey -and $currentKey -ne $script:CodexLastSessionChangeKey) {
+            $script:CodexLastSessionChangeKey = $currentKey
+            Update-Widget $sender.Tag
+        }
+    })
+    $timer.Start()
+    $script:CodexSessionChangeTimer = $timer
+}
+
+function Stop-CodexSessionWatcher {
+    if ($null -ne $script:CodexSessionChangeTimer) {
+        $script:CodexSessionChangeTimer.Stop()
+        $script:CodexSessionChangeTimer = $null
+    }
+
+    $script:CodexLastSessionChangeKey = ""
 }
 
 function New-TrayIcon($window) {
@@ -2746,6 +3063,7 @@ function Build-Widget {
             $sender.Stop()
             $script:StartupRefreshTimer = $null
             Update-Widget $controls
+            Start-CodexSessionWatcher $controls
         })
         $script:StartupRefreshTimer.Start()
     })
@@ -2821,6 +3139,7 @@ function Build-Widget {
             $script:CompactTopmostTimer.Stop()
             $script:CompactTopmostTimer = $null
         }
+        Stop-CodexSessionWatcher
         Save-State $window
         if ($null -ne $tray) {
             $tray.Visible = $false
