@@ -1,2 +1,2 @@
 @echo off
-start "" powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0usage-widget.ps1"
+start "" wscript.exe "%~dp0start-usage-widget.vbs"
