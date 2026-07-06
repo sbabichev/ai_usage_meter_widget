@@ -28,4 +28,19 @@ Describe "Compact layout helpers" {
         $layout.Width | Should Be $script:CompactDoubleWidth
         ($layout.Height -gt $script:CompactHeight) | Should Be $true
     }
+
+    It "styles the primary full row larger than the weekly row" {
+        $primary = New-LimitRow "CURRENT SESSION" $true 7
+        $secondary = New-LimitRow "WEEKLY" $false 7
+
+        ($primary.value.FontSize -gt $secondary.value.FontSize) | Should Be $true
+        ($primary.track.Height -gt $secondary.track.Height) | Should Be $true
+    }
+
+    It "starts compact panels without an inner box border" {
+        $panel = New-CompactProviderPanel "CODEX" "#6FE8FF"
+
+        $panel.panel.BorderThickness.Left | Should Be 0
+        $panel.panel.Padding.Bottom | Should BeGreaterThan 4
+    }
 }

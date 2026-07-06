@@ -56,8 +56,8 @@ $script:WidgetWidth = 360
 $script:WidgetHeight = 430
 $script:CompactSingleWidth = 270
 $script:CompactDoubleWidth = 520
-$script:CompactHeight = 62
-$script:CompactMultiRowHeight = 116
+$script:CompactHeight = 74
+$script:CompactMultiRowHeight = 136
 $script:StaleAfterSeconds = 900
 $script:ResetDriftToleranceSeconds = 120
 $script:MinimaxDefaultRefreshSeconds = 300
@@ -130,7 +130,7 @@ function New-ProviderMetadataMap {
             defaultEnabled = $false
             defaultVisible = $true
             supportsActivity = $false
-            supportsHint = $false
+            supportsHint = $true
             supportsRefresh = $true
             actionLabel = "API"
             actionToolTip = "Check via API"
@@ -384,12 +384,31 @@ function Get-UsageDisplayToggleLabel($mode = $script:UsageDisplayMode) {
     return "Show Left %"
 }
 
+function Format-DisplayPercent($percent) {
+    $safePercent = [Math]::Max([double]0, [Math]::Min([double]100, [double]$percent))
+    return ("{0}%" -f [Math]::Round($safePercent))
+}
+
+function Enable-TabularNumbers($block) {
+    if (-not $block) {
+        return $null
+    }
+
+    try {
+        [System.Windows.Documents.Typography]::SetNumeralAlignment($block, [System.Windows.FontNumeralAlignment]::Tabular)
+        [System.Windows.Documents.Typography]::SetNumeralStyle($block, [System.Windows.FontNumeralStyle]::Lining)
+    } catch {
+    }
+
+    return $block
+}
+
 function Set-LimitAccent($row, $usedPercent, $enabled) {
     $accent = if ($enabled) { Get-LimitAccent $usedPercent } else { "#6F7D85" }
     $row.fill.Background = Get-Brush $accent
     $row.value.Foreground = Get-Brush $accent
     if ($row.mode) {
-        $row.mode.Foreground = Get-Brush $accent
+        $row.mode.Foreground = Get-Brush "#D6E1E6"
     }
     if ($row.fill.Effect) {
         $row.fill.Effect.Color = Get-Color $accent
@@ -405,6 +424,12 @@ function New-TextBlock($text, $fontSize, $weight, $color) {
     $block.Foreground = Get-Brush $color
     $block.FontFamily = "Segoe UI Variable Text, Segoe UI"
     $block.TextTrimming = "CharacterEllipsis"
+    return $block
+}
+
+function New-NumericTextBlock($text, $fontSize, $weight, $color) {
+    $block = New-TextBlock $text $fontSize $weight $color
+    Enable-TabularNumbers $block | Out-Null
     return $block
 }
 
@@ -770,6 +795,7 @@ function Sync-ProviderVisibility($controls) {
     $script:MinimaxEnabled = Test-ProviderVisible "minimax"
 
     $visibleIds = Get-VisibleProviderIds
+    $compactColumns = (Get-CompactLayoutMetrics $visibleIds.Count).Columns
     foreach ($providerId in (Get-ProviderIds)) {
         $isVisible = $visibleIds -contains $providerId
         $fullControl = Get-ObjectValue $controls.ProviderSections $providerId $null
@@ -782,11 +808,24 @@ function Sync-ProviderVisibility($controls) {
 
         if ($compactControl) {
             $compactControl.panel.Visibility = if ($isVisible) { "Visible" } else { "Collapsed" }
-            $compactControl.panel.Margin = if ($isVisible -and $providerId -ne $visibleIds[-1]) { "0,0,8,0" } else { "0,0,0,0" }
+            if ($isVisible) {
+                $visibleIndex = [Array]::IndexOf($visibleIds, $providerId)
+                $columnIndex = if ($compactColumns -gt 0) { $visibleIndex % $compactColumns } else { 0 }
+                $rowIndex = if ($compactColumns -gt 0) { [Math]::Floor($visibleIndex / $compactColumns) } else { 0 }
+                $leftMargin = if ($columnIndex -gt 0) { 8 } else { 0 }
+                $topMargin = if ($rowIndex -gt 0) { 6 } else { 0 }
+                $compactControl.panel.Margin = "{0},{1},0,0" -f $leftMargin, $topMargin
+                $compactControl.panel.BorderThickness = if ($compactColumns -gt 1 -and $columnIndex -gt 0) { "1,0,0,0" } else { "0" }
+                $compactControl.panel.BorderBrush = Get-Brush "#53636D"
+                $compactControl.panel.BorderBrush.Opacity = 0.45
+            } else {
+                $compactControl.panel.Margin = "0"
+                $compactControl.panel.BorderThickness = 0
+            }
         }
     }
 
-    $controls.CompactContent.Columns = (Get-CompactLayoutMetrics $visibleIds.Count).Columns
+    $controls.CompactContent.Columns = $compactColumns
     Set-WidgetMode $controls.Window $controls $script:CompactMode $false
 }
 
@@ -1105,23 +1144,222 @@ function Format-Remaining($resetSeconds) {
     return ("{0}m left" -f [Math]::Max(1, [Math]::Ceiling($span.TotalMinutes)))
 }
 
-function Format-BaliReset($resetSeconds) {
+function Get-RemainingSpan($resetSeconds) {
     $resetAt = Convert-UnixSeconds $resetSeconds
     if (-not $resetAt) {
-        return "Reset unknown"
+        return $null
     }
 
-    $bali = $resetAt.UtcDateTime.AddHours(8)
-    return ("Reset {0} Bali" -f $bali.ToString("h:mm tt", [Globalization.CultureInfo]::InvariantCulture))
+    return ($resetAt.LocalDateTime - (Get-Date))
 }
 
-function Format-LocalReset($resetSeconds) {
-    $resetAt = Convert-UnixSeconds $resetSeconds
-    if (-not $resetAt) {
-        return "Reset unknown"
+function Format-CompactDuration($span) {
+    if ($null -eq $span) {
+        return "--"
     }
 
-    return ("Reset {0}" -f $resetAt.LocalDateTime.ToString("MMM d, h:mm tt", [Globalization.CultureInfo]::InvariantCulture))
+    if ($span.TotalSeconds -le 0) {
+        return "0m"
+    }
+
+    if ($span.TotalDays -ge 1) {
+        $days = [Math]::Floor($span.TotalDays)
+        $hours = $span.Hours
+        return if ($hours -gt 0) { "{0}d{1}h" -f $days, $hours } else { "{0}d" -f $days }
+    }
+
+    if ($span.TotalHours -ge 1) {
+        return "{0}h{1}m" -f [Math]::Floor($span.TotalHours), $span.Minutes
+    }
+
+    return "{0}m" -f [Math]::Max(1, [Math]::Ceiling($span.TotalMinutes))
+}
+
+function Format-ResetLabel($resetSeconds) {
+    $resetAt = Convert-UnixSeconds $resetSeconds
+    if (-not $resetAt) {
+        return "↻ --"
+    }
+
+    return ("↻ {0}" -f $resetAt.LocalDateTime.ToString("MMM d, h:mm tt", [Globalization.CultureInfo]::InvariantCulture))
+}
+
+function Format-CompactRemaining($resetSeconds, $icon = "↻") {
+    $value = Format-CompactDuration (Get-RemainingSpan $resetSeconds)
+    if ([string]::IsNullOrWhiteSpace($icon)) {
+        return $value
+    }
+
+    return "$icon $value"
+}
+
+function Get-UsageProjection($limit) {
+    if (-not $limit) {
+        return [pscustomobject]@{
+            Ready = $false
+            ElapsedPercent = 0
+            ProjectedUsedPercent = $null
+        }
+    }
+
+    $elapsedPercent = [Math]::Max([double]0, [Math]::Min([double]100, (Get-ElapsedPercent $limit)))
+    if ($elapsedPercent -lt 5) {
+        return [pscustomobject]@{
+            Ready = $false
+            ElapsedPercent = $elapsedPercent
+            ProjectedUsedPercent = $null
+        }
+    }
+
+    $usedPercent = [Math]::Max([double]0, [Math]::Min([double]100, [double]$limit.used_percent))
+    $projected = [Math]::Max([double]0, [Math]::Min([double]100, ($usedPercent / $elapsedPercent) * 100))
+    return [pscustomobject]@{
+        Ready = $true
+        ElapsedPercent = $elapsedPercent
+        ProjectedUsedPercent = [Math]::Round($projected)
+    }
+}
+
+function Get-StatusPalette($state) {
+    switch ($state) {
+        "wait" {
+            return [pscustomobject]@{
+                Foreground = "#FFD4B5"
+                Border = "#FF8A3D"
+                Background = "#332319"
+            }
+        }
+        "low" {
+            return [pscustomobject]@{
+                Foreground = "#F5E1A0"
+                Border = "#FFC857"
+                Background = "#312A16"
+            }
+        }
+        "reset_soon" {
+            return [pscustomobject]@{
+                Foreground = "#FFD4B5"
+                Border = "#FF8A3D"
+                Background = "#332319"
+            }
+        }
+        default {
+            return [pscustomobject]@{
+                Foreground = "#DDE8ED"
+                Border = "#6C7E89"
+                Background = "#1A242D"
+            }
+        }
+    }
+}
+
+function Get-UsageStatus($limit, $isStale = $false, $limitReachedType = $null, $projection = $null) {
+    if (-not $limit) {
+        return [pscustomobject]@{
+            State = "wait"
+            Label = "WAIT"
+            Icon = "■"
+            ChipText = "■ WAIT"
+            CountdownText = $null
+            Palette = Get-StatusPalette "wait"
+        }
+    }
+
+    if ($null -eq $projection) {
+        $projection = Get-UsageProjection $limit
+    }
+
+    $remainingSpan = Get-RemainingSpan $limit.resets_at
+    $remainingMinutes = if ($remainingSpan) { [Math]::Max(0, [Math]::Floor($remainingSpan.TotalMinutes)) } else { [int]::MaxValue }
+    $usedPercent = [Math]::Max([double]0, [Math]::Min([double]100, [double]$limit.used_percent))
+
+    if (-not [string]::IsNullOrWhiteSpace($limitReachedType) -or $usedPercent -ge 100) {
+        $countdown = if ($remainingSpan) { Format-CompactRemaining $limit.resets_at "⏳" } else { $null }
+        return [pscustomobject]@{
+            State = "wait"
+            Label = "WAIT"
+            Icon = "⏳"
+            ChipText = if ($countdown) { $countdown } else { "■ WAIT" }
+            CountdownText = $countdown
+            Palette = Get-StatusPalette "wait"
+        }
+    }
+
+    if ($remainingMinutes -le 30) {
+        return [pscustomobject]@{
+            State = "reset_soon"
+            Label = "RESET SOON"
+            Icon = "↻"
+            ChipText = "↻ RESET SOON"
+            CountdownText = $null
+            Palette = Get-StatusPalette "reset_soon"
+        }
+    }
+
+    $isLow = $usedPercent -ge 75 -or ($projection -and $projection.Ready -and $projection.ProjectedUsedPercent -ge 90) -or ($isStale -and $usedPercent -ge 85)
+    if ($isLow) {
+        return [pscustomobject]@{
+            State = "low"
+            Label = "LOW"
+            Icon = "▲"
+            ChipText = "▲ LOW"
+            CountdownText = $null
+            Palette = Get-StatusPalette "low"
+        }
+    }
+
+    return [pscustomobject]@{
+        State = "ok"
+        Label = "OK"
+        Icon = "●"
+        ChipText = "● OK"
+        CountdownText = $null
+        Palette = Get-StatusPalette "ok"
+    }
+}
+
+function Get-ProviderHint($providerId, $usage, $limitReachedType = $null) {
+    if (-not $usage -or -not $usage.ok -or -not $usage.primary) {
+        return [pscustomobject]@{
+            Text = "Pace: WAIT · waiting for fresh telemetry"
+            Color = "#D6E2E8"
+        }
+    }
+
+    $primaryProjection = Get-UsageProjection $usage.primary
+    $status = Get-UsageStatus $usage.primary $usage.isStale $limitReachedType $primaryProjection
+    $hintColor = $status.Palette.Foreground
+
+    if ($providerId -eq "codex" -and $status.State -eq "ok" -and $usage.secondary) {
+        $secondaryProjection = Get-UsageProjection $usage.secondary
+        if ($secondaryProjection.Ready -and $secondaryProjection.ProjectedUsedPercent -ge 90) {
+            $status = [pscustomobject]@{
+                State = "low"
+                Label = "LOW"
+                Palette = Get-StatusPalette "low"
+            }
+            $hintColor = $status.Palette.Foreground
+        }
+    }
+
+    if ($usage.isStale) {
+        return [pscustomobject]@{
+            Text = "Pace: {0} · telemetry may be stale" -f $status.Label
+            Color = "#FFC857"
+        }
+    }
+
+    if (-not $primaryProjection.Ready) {
+        return [pscustomobject]@{
+            Text = "Pace: {0} · building baseline" -f $status.Label
+            Color = $hintColor
+        }
+    }
+
+    return [pscustomobject]@{
+        Text = "Pace: {0} · projected {1}% used at reset" -f $status.Label, $primaryProjection.ProjectedUsedPercent
+        Color = $hintColor
+    }
 }
 
 function Get-TimeLeftPercent($limit) {
@@ -1148,100 +1386,12 @@ function Get-ElapsedPercent($limit) {
 }
 
 function Get-UsageHint($primary, $secondary, $isStale, $limitReachedType = $null) {
-    if (-not $primary -or -not $secondary) {
-        return [pscustomobject]@{
-            Text = "Waiting for fresh Codex limit telemetry."
-            Color = "#D6E2E8"
-        }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($limitReachedType)) {
-        return [pscustomobject]@{
-            Text = "Codex reports a limit is reached. Wait for reset or switch models."
-            Color = "#FF8A3D"
-        }
-    }
-
-    $sessionUsed = [double]$primary.used_percent
-    $sessionElapsed = Get-ElapsedPercent $primary
-    $weeklyUsed = [double]$secondary.used_percent
-    $weeklyElapsed = Get-ElapsedPercent $secondary
-    $sessionDelta = $sessionUsed - $sessionElapsed
-    $weeklyDelta = $weeklyUsed - $weeklyElapsed
-
-    if ($isStale) {
-        $text = if ($sessionUsed -ge 85 -or $weeklyUsed -ge 85) {
-            "Telemetry paused near the cap. Limit may already be exhausted."
-        } else {
-            "Telemetry paused. Values may lag until Codex reports again."
-        }
-
-        return [pscustomobject]@{
-            Text = $text
-            Color = "#FFC857"
-        }
-    }
-
-    if ($sessionUsed -ge 92) {
-        return [pscustomobject]@{
-            Text = "Session limit is nearly spent. Save heavy work for reset."
-            Color = "#FF8A3D"
-        }
-    }
-
-    if ($sessionElapsed -le 12 -and $sessionUsed -ge 30) {
-        return [pscustomobject]@{
-            Text = "Fast start: session usage is ahead of the clock."
-            Color = "#FFC857"
-        }
-    }
-
-    if ($sessionDelta -ge 25) {
-        return [pscustomobject]@{
-            Text = "High burn rate. Slow down or switch to lighter tasks."
-            Color = "#FFC857"
-        }
-    }
-
-    if ($sessionElapsed -ge 70 -and $sessionUsed -le 45) {
-        return [pscustomobject]@{
-            Text = "Plenty left in this session. No need to economize."
-            Color = "#A6FF4F"
-        }
-    }
-
-    if ($weeklyElapsed -ge 75 -and $weeklyUsed -le 35) {
-        return [pscustomobject]@{
-            Text = "Week is late and usage is low. You have room to spend."
-            Color = "#A6FF4F"
-        }
-    }
-
-    if ($weeklyDelta -ge 20) {
-        return [pscustomobject]@{
-            Text = "Weekly pace is hot. Keep an eye on large runs."
-            Color = "#FFC857"
-        }
-    }
-
-    if ($weeklyElapsed -ge 45 -and $weeklyUsed -le 25) {
-        return [pscustomobject]@{
-            Text = "Weekly limit is underused for this point in the week."
-            Color = "#A6FF4F"
-        }
-    }
-
-    if ($sessionDelta -le -20 -and $sessionUsed -le 55) {
-        return [pscustomobject]@{
-            Text = "Comfortable pace. You can keep working normally."
-            Color = "#A6FF4F"
-        }
-    }
-
-    return [pscustomobject]@{
-        Text = "Usage pace looks balanced."
-        Color = "#D6E2E8"
-    }
+    return Get-ProviderHint "codex" ([pscustomobject]@{
+            ok = ($null -ne $primary)
+            primary = $primary
+            secondary = $secondary
+            isStale = $isStale
+        }) $limitReachedType
 }
 
 function Convert-ToNumber($value) {
@@ -2942,32 +3092,70 @@ function Update-TimeTicks($timeBar) {
     }
 }
 
+function New-StatusChip($fontSize = 8.25) {
+    $border = New-Object System.Windows.Controls.Border
+    $border.Padding = "6,1,6,1"
+    $border.Margin = "8,1,0,0"
+    $border.CornerRadius = 7
+    $border.BorderThickness = 1
+    $border.Visibility = "Collapsed"
+
+    $text = New-NumericTextBlock "" $fontSize "SemiBold" "#DDE8ED"
+    $text.VerticalAlignment = "Center"
+    $text.HorizontalAlignment = "Center"
+    $text.TextWrapping = "NoWrap"
+    $border.Child = $text
+
+    return [pscustomobject]@{
+        Border = $border
+        Text = $text
+    }
+}
+
+function Set-StatusChipVisual($border, $textBlock, $status, $visible = $true) {
+    if (-not $border -or -not $textBlock -or -not $visible -or -not $status) {
+        if ($border) {
+            $border.Visibility = "Collapsed"
+        }
+        return
+    }
+
+    $palette = if ($status.Palette) { $status.Palette } else { Get-StatusPalette "ok" }
+    $border.Visibility = "Visible"
+    $border.Background = Get-Brush $palette.Background
+    $border.BorderBrush = Get-Brush $palette.Border
+    $textBlock.Foreground = Get-Brush $palette.Foreground
+    $textBlock.Text = $status.ChipText
+}
+
 function New-LimitRow($title, $large, $timeSegments) {
     $panel = New-Object System.Windows.Controls.StackPanel
-    $panel.Margin = "0,8,0,0"
+    $panel.Margin = if ($large) { "0,10,0,0" } else { "0,4,0,0" }
 
     $header = New-Object System.Windows.Controls.Grid
     $header.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
     $header.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
 
-    $titleSize = 10.5
-    $valueSize = 17
-    $barHeight = 7
-    $barRadius = 3.5
+    $titleSize = if ($large) { 9.75 } else { 9.0 }
+    $valueSize = if ($large) { 18.5 } else { 15.5 }
+    $barHeight = if ($large) { 8 } else { 5 }
+    $barRadius = $barHeight / 2
 
-    $titleBlock = New-TextBlock $title $titleSize "SemiBold" "#F1F5F7"
-    $titleBlock.Opacity = 0.76
-    $value = New-TextBlock "%0" $valueSize "Light" "#9DFF58"
+    $titleBlock = New-TextBlock $title $titleSize "SemiBold" "#D5DEE3"
+    $titleBlock.Opacity = 0.66
+    $value = New-NumericTextBlock "0%" $valueSize "Light" "#9DFF58"
     $value.Margin = "12,0,0,0"
-    $mode = New-TextBlock "used" 8.5 "SemiBold" "#D0D5D6"
-    $mode.Margin = "6,4,2,0"
-    $mode.Opacity = 0.66
+    $mode = New-TextBlock "used" 8.25 "SemiBold" "#D6E1E6"
+    $mode.Margin = "6,4,0,0"
+    $mode.Opacity = 0.78
+    $statusChip = New-StatusChip
 
     $valueWrap = New-Object System.Windows.Controls.StackPanel
     $valueWrap.Orientation = "Horizontal"
     $valueWrap.HorizontalAlignment = "Right"
     $valueWrap.Children.Add($value) | Out-Null
     $valueWrap.Children.Add($mode) | Out-Null
+    $valueWrap.Children.Add($statusChip.Border) | Out-Null
     [System.Windows.Controls.Grid]::SetColumn($valueWrap, 1)
 
     $header.Children.Add($titleBlock) | Out-Null
@@ -2992,18 +3180,18 @@ function New-LimitRow($title, $large, $timeSegments) {
     }
 
     $bar = New-Object System.Windows.Controls.Grid
-    $bar.Margin = "0,5,0,0"
+    $bar.Margin = if ($large) { "0,5,0,0" } else { "0,3,0,0" }
     $bar.Children.Add($track) | Out-Null
     $bar.Children.Add($fill) | Out-Null
 
-    $reset = New-TextBlock "" 9 "Regular" "#D0D5D6"
-    $reset.Margin = "0,5,0,0"
-    $reset.Opacity = 0.58
+    $reset = New-NumericTextBlock "" 9 "Regular" "#E0E7EA"
+    $reset.Margin = if ($large) { "0,5,0,0" } else { "0,3,0,0" }
+    $reset.Opacity = 0.8
 
-    $left = New-TextBlock "" 9 "Regular" "#D0D5D6"
-    $left.Margin = "0,5,0,0"
+    $left = New-NumericTextBlock "" 9 "Regular" "#E0E7EA"
+    $left.Margin = if ($large) { "0,5,0,0" } else { "0,3,0,0" }
     $left.HorizontalAlignment = "Right"
-    $left.Opacity = 0.58
+    $left.Opacity = 0.8
 
     $timeTextGrid = New-Object System.Windows.Controls.Grid
     $timeTextGrid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
@@ -3013,14 +3201,14 @@ function New-LimitRow($title, $large, $timeSegments) {
     $timeTextGrid.Children.Add($left) | Out-Null
 
     $timeTrack = New-Object System.Windows.Controls.Border
-    $timeTrack.Height = 5
-    $timeTrack.CornerRadius = 2.5
+    $timeTrack.Height = if ($large) { 5 } else { 4 }
+    $timeTrack.CornerRadius = $timeTrack.Height / 2
     $timeTrack.Background = Get-Brush "#62737D"
-    $timeTrack.Opacity = 0.28
+    $timeTrack.Opacity = 0.36
 
     $timeFill = New-Object System.Windows.Controls.Border
-    $timeFill.Height = 5
-    $timeFill.CornerRadius = 2.5
+    $timeFill.Height = $timeTrack.Height
+    $timeFill.CornerRadius = $timeTrack.CornerRadius
     $timeFill.HorizontalAlignment = "Left"
     $timeFill.Background = Get-Brush "#D6E2E8"
     $timeFill.Opacity = 0.64
@@ -3032,14 +3220,14 @@ function New-LimitRow($title, $large, $timeSegments) {
     }
 
     $timeElapsed = New-Object System.Windows.Controls.Border
-    $timeElapsed.Height = 5
-    $timeElapsed.CornerRadius = 2.5
+    $timeElapsed.Height = $timeTrack.Height
+    $timeElapsed.CornerRadius = $timeTrack.CornerRadius
     $timeElapsed.HorizontalAlignment = "Left"
     $timeElapsed.Background = Get-Brush "#435865"
     $timeElapsed.Opacity = 0.26
 
     $timeBar = New-Object System.Windows.Controls.Grid
-    $timeBar.Margin = "0,5,0,0"
+    $timeBar.Margin = if ($large) { "0,5,0,0" } else { "0,3,0,0" }
     $timeBar.Children.Add($timeTrack) | Out-Null
     $timeBar.Children.Add($timeElapsed) | Out-Null
     $timeBar.Children.Add($timeFill) | Out-Null
@@ -3069,9 +3257,12 @@ function New-LimitRow($title, $large, $timeSegments) {
 
     $row = [pscustomobject]@{
         panel = $panel
+        isPrimary = [bool]$large
         title = $titleBlock
         value = $value
         mode = $mode
+        statusBorder = $statusChip.Border
+        statusText = $statusChip.Text
         track = $track
         fill = $fill
         reset = $reset
@@ -3124,41 +3315,47 @@ function Set-CompactWeeklyAccent($panel, $usedPercent, $enabled) {
 
 function New-CompactProviderPanel($name, $accentColor) {
     $panelBorder = New-Object System.Windows.Controls.Border
-    $panelBorder.Padding = "9,4,9,4"
-    $panelBorder.BorderThickness = 1
-    $panelBorder.CornerRadius = 9
-    $panelBorder.BorderBrush = Get-Brush $accentColor
-    $panelBorder.BorderBrush.Opacity = 0.35
+    $panelBorder.Padding = "8,4,8,6"
+    $panelBorder.BorderThickness = 0
+    $panelBorder.CornerRadius = 0
+    $panelBorder.BorderBrush = Get-Brush "#53636D"
     $panelBorder.Background = [System.Windows.Media.Brushes]::Transparent
 
     $grid = New-Object System.Windows.Controls.Grid
     $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
     $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
+    $grid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
+    $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
+    $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
     $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
     $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
-    $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
     $grid.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
 
     $label = New-TextBlock $name 9.5 "SemiBold" $accentColor
     $label.Opacity = 0.9
     $label.VerticalAlignment = "Center"
 
-    $percentText = New-TextBlock "--" 16 "Light" "#A6FF4F"
+    $percentText = New-NumericTextBlock "--" 16 "Light" "#A6FF4F"
     $percentText.Margin = "10,-2,0,0"
     $percentText.VerticalAlignment = "Center"
     [System.Windows.Controls.Grid]::SetColumn($percentText, 1)
+    $statusChip = New-StatusChip 8.0
+    $statusChip.Border.Margin = "10,0,0,0"
+    [System.Windows.Controls.Grid]::SetColumn($statusChip.Border, 2)
 
-    $timeText = New-TextBlock "--" 9.5 "Regular" "#D6E2E8"
+    $timeText = New-NumericTextBlock "↻ --" 9 "Regular" "#E0E8EC"
     $timeText.Margin = "10,1,0,0"
-    $timeText.Opacity = 0.74
-    $timeText.VerticalAlignment = "Center"
-    [System.Windows.Controls.Grid]::SetColumn($timeText, 2)
+    $timeText.Opacity = 0.84
+    [System.Windows.Controls.Grid]::SetRow($timeText, 1)
+    [System.Windows.Controls.Grid]::SetColumn($timeText, 1)
+    [System.Windows.Controls.Grid]::SetColumnSpan($timeText, 3)
 
-    $weeklyText = New-TextBlock "W --" 9.5 "SemiBold" "#D6E2E8"
+    $weeklyText = New-NumericTextBlock "W --" 9 "SemiBold" "#D6E2E8"
     $weeklyText.Margin = "12,1,0,0"
     $weeklyText.Opacity = 0.78
     $weeklyText.VerticalAlignment = "Center"
-    [System.Windows.Controls.Grid]::SetColumn($weeklyText, 3)
+    [System.Windows.Controls.Grid]::SetRow($weeklyText, 1)
+    [System.Windows.Controls.Grid]::SetColumn($weeklyText, 4)
 
     $track = New-Object System.Windows.Controls.Border
     $track.Height = 7
@@ -3182,11 +3379,12 @@ function New-CompactProviderPanel($name, $accentColor) {
     $bar.Margin = "0,4,0,0"
     $bar.Children.Add($track) | Out-Null
     $bar.Children.Add($fill) | Out-Null
-    [System.Windows.Controls.Grid]::SetRow($bar, 1)
-    [System.Windows.Controls.Grid]::SetColumnSpan($bar, 4)
+    [System.Windows.Controls.Grid]::SetRow($bar, 2)
+    [System.Windows.Controls.Grid]::SetColumnSpan($bar, 5)
 
     $grid.Children.Add($label) | Out-Null
     $grid.Children.Add($percentText) | Out-Null
+    $grid.Children.Add($statusChip.Border) | Out-Null
     $grid.Children.Add($timeText) | Out-Null
     $grid.Children.Add($weeklyText) | Out-Null
     $grid.Children.Add($bar) | Out-Null
@@ -3197,6 +3395,8 @@ function New-CompactProviderPanel($name, $accentColor) {
         panel = $panelBorder
         label = $label
         percentText = $percentText
+        statusBorder = $statusChip.Border
+        statusText = $statusChip.Text
         timeText = $timeText
         weeklyText = $weeklyText
         track = $track
@@ -3235,9 +3435,9 @@ function New-ProviderSection($metadata) {
 
     $label = New-TextBlock $metadata.title 9.5 "SemiBold" $metadata.accent
     $label.Opacity = 0.85
-    $updated = New-TextBlock "not updated" 9 "Regular" "#AAB7BD"
+    $updated = New-NumericTextBlock "not updated" 9 "Regular" "#C7D0D5"
     $updated.Margin = "8,0,0,0"
-    $updated.Opacity = 0.62
+    $updated.Opacity = 0.74
     [System.Windows.Controls.Grid]::SetColumn($updated, 1)
 
     $actionButton = $null
@@ -3269,7 +3469,7 @@ function New-ProviderSection($metadata) {
 
     $rows = @()
     foreach ($windowTitle in $metadata.defaultWindows) {
-        $row = New-LimitRow $windowTitle $false 7
+        $row = New-LimitRow $windowTitle ($rows.Count -eq 0) 7
         $rows += $row
         $inner.Children.Add($row.panel) | Out-Null
     }
@@ -3278,9 +3478,9 @@ function New-ProviderSection($metadata) {
 
     $activityBlock = $null
     if ([bool](Get-ObjectValue $metadata "showActivityBlock" $false)) {
-        $activityBlock = New-TextBlock "Last activity: waiting for token details" 9 "Regular" "#E2E9EC"
+        $activityBlock = New-NumericTextBlock "Last activity: waiting for token details" 9 "Regular" "#E7EEF1"
         $activityBlock.Margin = "0,6,0,0"
-        $activityBlock.Opacity = 0.74
+        $activityBlock.Opacity = 0.86
         $inner.Children.Add($activityBlock) | Out-Null
     }
 
@@ -3288,7 +3488,7 @@ function New-ProviderSection($metadata) {
     if ($metadata.supportsHint) {
         $hintBlock = New-TextBlock "Usage pace looks balanced." 9.5 "Regular" "#D6E2E8"
         $hintBlock.Margin = "0,2,0,0"
-        $hintBlock.Opacity = 0.78
+        $hintBlock.Opacity = 0.86
         $inner.Children.Add($hintBlock) | Out-Null
     }
 
@@ -3304,11 +3504,6 @@ function New-ProviderSection($metadata) {
         Activity = $activityBlock
         Hint = $hintBlock
     }
-}
-
-function Format-CompactRemaining($resetSeconds) {
-    $text = Format-Remaining $resetSeconds
-    return $text -replace " left$", ""
 }
 
 function Get-ProviderUsageWindows($metadata, $usage) {
@@ -3358,9 +3553,10 @@ function Format-CompactTooltip($metadata, $usage, $activity) {
 function Update-CompactProviderPanel($panel, $metadata, $usage, $activity) {
     if (-not $usage -or -not $usage.ok -or -not $usage.primary) {
         $panel.percentText.Text = "--"
-        $panel.timeText.Text = "waiting"
+        $panel.timeText.Text = "↻ --"
         $panel.weeklyText.Text = ""
         $panel.panel.ToolTip = "{0}: waiting for telemetry" -f $metadata.label
+        Set-StatusChipVisual $panel.statusBorder $panel.statusText $null $false
         Set-CompactAccent $panel 0 $false
         Set-CompactWeeklyAccent $panel 0 $false
         Set-CompactProgress $panel 0
@@ -3369,12 +3565,14 @@ function Update-CompactProviderPanel($panel, $metadata, $usage, $activity) {
 
     $primaryDisplay = Get-UsageDisplayData $usage.primary.used_percent
     $weeklyDisplay = if ($usage.secondary) { Get-UsageDisplayData $usage.secondary.used_percent } else { $null }
+    $status = Get-UsageStatus $usage.primary $usage.isStale (Get-ObjectValue $usage "limitReachedType" $null)
     $percent = [Math]::Round([double]$primaryDisplay.percent)
     $weeklyPercent = if ($weeklyDisplay) { [Math]::Round([double]$weeklyDisplay.percent) } else { $null }
-    $panel.percentText.Text = "$percent%"
-    $panel.timeText.Text = Format-CompactRemaining $usage.primary.resets_at
+    $panel.percentText.Text = Format-DisplayPercent $percent
+    $panel.timeText.Text = if ($status.CountdownText) { Format-ResetLabel $usage.primary.resets_at } else { Format-CompactRemaining $usage.primary.resets_at }
     $panel.weeklyText.Text = if ($null -ne $weeklyPercent) { "W $weeklyPercent%" } else { "" }
     $panel.panel.ToolTip = Format-CompactTooltip $metadata $usage $activity
+    Set-StatusChipVisual $panel.statusBorder $panel.statusText $status $true
     Set-CompactAccent $panel $primaryDisplay.accentPercent $true
     $weeklyAccentPercent = if ($weeklyDisplay) { $weeklyDisplay.accentPercent } else { $null }
     Set-CompactWeeklyAccent $panel $weeklyAccentPercent ($null -ne $weeklyPercent)
@@ -3398,7 +3596,7 @@ function Update-ProviderSection($control, $usage, $activity) {
         }
 
         if ($control.Hint) {
-            $hint = if ($metadata.id -eq "codex") { Get-UsageHint $null $null $false } else { [pscustomobject]@{ Text = "Waiting for telemetry."; Color = "#D6E2E8" } }
+            $hint = Get-ProviderHint $metadata.id $null
             $control.Hint.Text = $hint.Text
             $control.Hint.Foreground = Get-Brush $hint.Color
         }
@@ -3417,16 +3615,17 @@ function Update-ProviderSection($control, $usage, $activity) {
         if ($i -lt $windows.Count) {
             $window = $windows[$i]
             $row.panel.Visibility = "Visible"
-            $resetText = if ($i -eq 0 -and $metadata.id -eq "codex") { Format-BaliReset $window.limit.resets_at } else { Format-LocalReset $window.limit.resets_at }
+            $status = if ($row.isPrimary) { Get-UsageStatus $window.limit $usage.isStale (Get-ObjectValue $usage "limitReachedType" $null) } else { $null }
+            $resetText = Format-ResetLabel $window.limit.resets_at
             $timeText = Format-Remaining $window.limit.resets_at
-            Update-LimitRow $row $window.limit $resetText $timeText
+            Update-LimitRow $row $window.limit $resetText $timeText $status
         } else {
             $row.panel.Visibility = "Collapsed"
         }
     }
 
-    if ($control.Hint -and $metadata.id -eq "codex") {
-        $hint = Get-UsageHint $usage.primary $usage.secondary $usage.isStale $usage.limitReachedType
+    if ($control.Hint) {
+        $hint = Get-ProviderHint $metadata.id $usage (Get-ObjectValue $usage "limitReachedType" $null)
         $control.Hint.Text = $hint.Text
         $control.Hint.Foreground = Get-Brush $hint.Color
     }
@@ -3439,12 +3638,13 @@ function Update-ProviderSection($control, $usage, $activity) {
     $control.Updated.Text = Format-ProviderUpdatedText $usage $metadata.id
 }
 
-function Update-LimitRow($row, $limit, $resetText, $timeText) {
+function Update-LimitRow($row, $limit, $resetText, $timeText, $status = $null) {
     if (-not $limit) {
         $row.value.Text = "--"
         $row.mode.Text = Normalize-UsageDisplayMode $script:UsageDisplayMode
         $row.reset.Text = $resetText
         $row.left.Text = $timeText
+        Set-StatusChipVisual $row.statusBorder $row.statusText $null $false
         Set-LimitAccent $row 0 $false
         Set-Progress $row 0
         Set-TimeProgress $row 0
@@ -3453,11 +3653,12 @@ function Update-LimitRow($row, $limit, $resetText, $timeText) {
 
     $display = Get-UsageDisplayData $limit.used_percent
     $percent = [Math]::Round([double]$display.percent)
-    $row.value.Text = "%$percent"
+    $row.value.Text = Format-DisplayPercent $percent
     $row.mode.Text = $display.mode
     $row.value.UpdateLayout()
     $row.reset.Text = $resetText
     $row.left.Text = $timeText
+    Set-StatusChipVisual $row.statusBorder $row.statusText $status $row.isPrimary
     Set-LimitAccent $row $display.accentPercent $true
     Set-Progress $row $percent
     Set-TimeProgress $row (Get-TimeLeftPercent $limit)
