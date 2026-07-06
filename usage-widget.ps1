@@ -48,26 +48,37 @@ $script:LocalConfigPath = Join-Path $script:AppDir "usage-widget.local.json"
 $script:LogPath = Join-Path $script:AppDir "usage-widget.log"
 $script:CodexSessionsDir = Join-Path $env:USERPROFILE ".codex\sessions"
 $script:CodexLogsPath = Join-Path $env:USERPROFILE ".codex\logs_2.sqlite"
+$script:GrokLogsPath = Join-Path $env:USERPROFILE ".grok\logs\unified.jsonl"
+$script:GrokAuthPath = Join-Path $env:USERPROFILE ".grok\auth.json"
 $script:IconPath = Join-Path $script:AppDir "assets\codex-usage-meter.ico"
 $script:CodexUsageDashboardUrl = "https://chatgpt.com/codex/settings/usage"
 $script:WidgetWidth = 360
-$script:WidgetHeight = 450
+$script:WidgetHeight = 430
 $script:CompactSingleWidth = 270
 $script:CompactDoubleWidth = 520
 $script:CompactHeight = 62
+$script:CompactMultiRowHeight = 116
 $script:StaleAfterSeconds = 900
 $script:ResetDriftToleranceSeconds = 120
 $script:MinimaxDefaultRefreshSeconds = 300
 $script:MinimaxTokenPlanUrl = "https://api.minimax.io/v1/token_plan/remains"
+$script:GrokBillingApiUrl = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+$script:GrokClientVersion = $null
 $script:MinimaxRemoteState = @{
     LastFetch = $null
     Usage = $null
     Error = $null
 }
+$script:GrokRemoteState = @{
+    Usage = $null
+    Error = $null
+    RefreshStatus = $null
+}
 $script:CodexEnabled = $true
 $script:MinimaxEnabled = $true
 $script:CompactMode = $false
 $script:TopmostEnabled = $true
+$script:UsageDisplayMode = "used"
 $script:UsageSnapshot = $null
 $script:StartupRefreshTimer = $null
 $script:CompactTopmostTimer = $null
@@ -83,6 +94,241 @@ $script:MinimaxFloorState = @{
     WindowKey = ""
     PrimaryUsed = $null
     SecondaryUsed = $null
+}
+
+function New-ProviderMetadataMap {
+    return [ordered]@{
+        codex = [pscustomobject]@{
+            id = "codex"
+            label = "Codex"
+            title = "CODEX"
+            accent = "#6FE8FF"
+            defaultEnabled = $true
+            defaultVisible = $true
+            supportsActivity = $true
+            supportsHint = $true
+            supportsRefresh = $false
+            defaultWindows = @("CURRENT SESSION", "WEEKLY")
+        }
+        minimax = [pscustomobject]@{
+            id = "minimax"
+            label = "MiniMax"
+            title = "MINIMAX"
+            accent = "#FF8A3D"
+            defaultEnabled = $false
+            defaultVisible = $true
+            supportsActivity = $false
+            supportsHint = $false
+            supportsRefresh = $false
+            defaultWindows = @("CURRENT SESSION", "WEEKLY")
+        }
+        grok = [pscustomobject]@{
+            id = "grok"
+            label = "Grok"
+            title = "GROK"
+            accent = "#B9A7FF"
+            defaultEnabled = $false
+            defaultVisible = $true
+            supportsActivity = $false
+            supportsHint = $false
+            supportsRefresh = $true
+            actionLabel = "API"
+            actionToolTip = "Check via API"
+            defaultWindows = @("WEEKLY")
+        }
+    }
+}
+
+$script:ProviderMetadata = New-ProviderMetadataMap
+$script:ProviderVisibility = [ordered]@{}
+$script:ProviderEnabledMap = [ordered]@{}
+$script:ProviderActionStatus = [ordered]@{}
+
+function Get-ProviderIds {
+    return @($script:ProviderMetadata.Keys)
+}
+
+function Get-ProviderMetadata($providerId) {
+    return Get-ObjectValue $script:ProviderMetadata $providerId $null
+}
+
+function Test-IsConfigObject($value) {
+    return ($value -is [System.Collections.IDictionary]) -or ($value -is [psobject] -and $null -ne $value.PSObject)
+}
+
+function Get-ObjectEntries($value) {
+    if ($null -eq $value) {
+        return @()
+    }
+
+    if ($value -is [System.Collections.IDictionary]) {
+        return @($value.GetEnumerator())
+    }
+
+    return @($value.PSObject.Properties)
+}
+
+function Merge-ConfigObject($target, $source) {
+    if (-not (Test-IsConfigObject $target)) {
+        $target = [pscustomobject]@{}
+    }
+
+    if (-not (Test-IsConfigObject $source)) {
+        return $target
+    }
+
+    foreach ($entry in (Get-ObjectEntries $source)) {
+        $name = if ($entry -is [System.Collections.DictionaryEntry]) { [string]$entry.Key } else { [string]$entry.Name }
+        $value = if ($entry -is [System.Collections.DictionaryEntry]) { $entry.Value } else { $entry.Value }
+        $existing = Get-ObjectValue $target $name $null
+
+        if ((Test-IsConfigObject $existing) -and (Test-IsConfigObject $value)) {
+            $merged = Merge-ConfigObject $existing $value
+            $target | Add-Member -MemberType NoteProperty -Name $name -Value $merged -Force
+            continue
+        }
+
+        $target | Add-Member -MemberType NoteProperty -Name $name -Value $value -Force
+    }
+
+    return $target
+}
+
+function Get-ProviderConfigObject($config, $providerId) {
+    if (-not $config) {
+        return $null
+    }
+
+    $topLevel = Get-ObjectValue $config $providerId $null
+    $providersRoot = Get-ObjectValue $config "providers" $null
+    $nested = Get-ObjectValue $providersRoot $providerId $null
+
+    if ((Test-IsConfigObject $topLevel) -and (Test-IsConfigObject $nested)) {
+        return Merge-ConfigObject $topLevel $nested
+    }
+
+    if (Test-IsConfigObject $topLevel) {
+        return $topLevel
+    }
+
+    if (Test-IsConfigObject $nested) {
+        return $nested
+    }
+
+    return $null
+}
+
+function New-DefaultProviderVisibilityMap {
+    $map = [ordered]@{}
+    foreach ($providerId in (Get-ProviderIds)) {
+        $metadata = Get-ProviderMetadata $providerId
+        $map[$providerId] = [bool](Get-ObjectValue $metadata "defaultVisible" $true)
+    }
+
+    return $map
+}
+
+function Get-ProviderEnabledMap($config) {
+    $map = [ordered]@{}
+    foreach ($providerId in (Get-ProviderIds)) {
+        $metadata = Get-ProviderMetadata $providerId
+        $providerConfig = Get-ProviderConfigObject $config $providerId
+        $defaultEnabled = [bool](Get-ObjectValue $metadata "defaultEnabled" $false)
+        $enabled = Convert-ToBoolean (Get-ObjectValue $providerConfig "enabled" $null) $defaultEnabled
+        $map[$providerId] = [bool]$enabled
+    }
+
+    return $map
+}
+
+function Normalize-ProviderVisibilityMap($rawVisibility, $enabledMap) {
+    $visibility = [ordered]@{}
+
+    foreach ($providerId in (Get-ProviderIds)) {
+        $metadata = Get-ProviderMetadata $providerId
+        $defaultVisible = [bool](Get-ObjectValue $metadata "defaultVisible" $true)
+        $isEnabled = [bool](Get-ObjectValue $enabledMap $providerId $false)
+        $savedValue = Get-ObjectValue $rawVisibility $providerId $null
+        if (-not $isEnabled) {
+            $visibility[$providerId] = $false
+        } elseif ($null -eq $savedValue) {
+            $visibility[$providerId] = if ($isEnabled) { $defaultVisible } else { $false }
+        } else {
+            $visibility[$providerId] = [bool]$savedValue
+        }
+    }
+
+    $enabledVisibleIds = @(
+        foreach ($providerId in (Get-ProviderIds)) {
+            if ([bool](Get-ObjectValue $enabledMap $providerId $false) -and [bool](Get-ObjectValue $visibility $providerId $false)) {
+                $providerId
+            }
+        }
+    )
+
+    if ($enabledVisibleIds.Count -eq 0) {
+        foreach ($providerId in (Get-ProviderIds)) {
+            if ([bool](Get-ObjectValue $enabledMap $providerId $false)) {
+                $visibility[$providerId] = $true
+                break
+            }
+        }
+    }
+
+    return $visibility
+}
+
+function Get-VisibleProviderIds {
+    return @(
+        foreach ($providerId in (Get-ProviderIds)) {
+            if ([bool](Get-ObjectValue $script:ProviderEnabledMap $providerId $false) -and [bool](Get-ObjectValue $script:ProviderVisibility $providerId $false)) {
+                $providerId
+            }
+        }
+    )
+}
+
+function Test-ProviderVisible($providerId) {
+    return [bool](Get-ObjectValue $script:ProviderVisibility $providerId $false)
+}
+
+function Set-ProviderVisible($providerId, $visible) {
+    $script:ProviderVisibility[$providerId] = [bool]$visible
+}
+
+function Test-CanHideProvider($providerId, $enabledMap = $script:ProviderEnabledMap, $visibilityMap = $script:ProviderVisibility) {
+    if (-not [bool](Get-ObjectValue $enabledMap $providerId $false)) {
+        return $false
+    }
+
+    if (-not [bool](Get-ObjectValue $visibilityMap $providerId $false)) {
+        return $true
+    }
+
+    $visibleCount = 0
+    foreach ($candidateProviderId in (Get-ProviderIds)) {
+        if ([bool](Get-ObjectValue $enabledMap $candidateProviderId $false) -and [bool](Get-ObjectValue $visibilityMap $candidateProviderId $false)) {
+            $visibleCount++
+        }
+    }
+
+    return ($visibleCount -gt 1)
+}
+
+function Get-ProviderActionStatus($providerId) {
+    return Get-ObjectValue $script:ProviderActionStatus $providerId $null
+}
+
+function Set-ProviderActionStatus($providerId, $state, $summary = $null, $detail = $null) {
+    $status = [pscustomobject]@{
+        state = $state
+        summary = $summary
+        detail = $detail
+        updated = Get-Date
+    }
+
+    $script:ProviderActionStatus[$providerId] = $status
+    return $status
 }
 
 function Get-Brush($hex) {
@@ -110,10 +356,41 @@ function Get-LimitAccent($usedPercent) {
     return "#A6FF4F"
 }
 
+function Normalize-UsageDisplayMode($mode) {
+    if ([string]$mode -eq "left") {
+        return "left"
+    }
+
+    return "used"
+}
+
+function Get-UsageDisplayData($usedPercent) {
+    $safeUsed = [Math]::Max([double]0, [Math]::Min([double]100, [double]$usedPercent))
+    $mode = Normalize-UsageDisplayMode $script:UsageDisplayMode
+    $displayPercent = if ($mode -eq "left") { 100 - $safeUsed } else { $safeUsed }
+
+    return [pscustomobject]@{
+        mode = $mode
+        percent = $displayPercent
+        accentPercent = if ($mode -eq "left") { 100 - $displayPercent } else { $displayPercent }
+    }
+}
+
+function Get-UsageDisplayToggleLabel($mode = $script:UsageDisplayMode) {
+    if ((Normalize-UsageDisplayMode $mode) -eq "left") {
+        return "Show Used %"
+    }
+
+    return "Show Left %"
+}
+
 function Set-LimitAccent($row, $usedPercent, $enabled) {
     $accent = if ($enabled) { Get-LimitAccent $usedPercent } else { "#6F7D85" }
     $row.fill.Background = Get-Brush $accent
     $row.value.Foreground = Get-Brush $accent
+    if ($row.mode) {
+        $row.mode.Foreground = Get-Brush $accent
+    }
     if ($row.fill.Effect) {
         $row.fill.Effect.Color = Get-Color $accent
         $row.fill.Effect.Opacity = if ($enabled) { 0.42 } else { 0.12 }
@@ -282,12 +559,10 @@ function Read-State {
         opacity = 1.0
         refreshSeconds = 3
         compactMode = $false
+        displayMode = "used"
         usageSnapshot = $null
         usageFloor = $null
-        providers = [ordered]@{
-            codex = $true
-            minimax = $true
-        }
+        providers = New-DefaultProviderVisibilityMap
     }
 
     if (-not (Test-Path $script:StatePath)) {
@@ -309,6 +584,14 @@ function Read-State {
 
 function Get-ObjectValue($object, $name, $fallback = $null) {
     if ($null -eq $object) {
+        return $fallback
+    }
+
+    if ($object -is [System.Collections.IDictionary]) {
+        if ($object.Contains($name)) {
+            return $object[$name]
+        }
+
         return $fallback
     }
 
@@ -397,16 +680,7 @@ function Read-Config {
         try {
             $raw = [System.IO.File]::ReadAllText($script:LocalConfigPath, [System.Text.Encoding]::UTF8)
             $localConfig = $raw | ConvertFrom-Json
-            foreach ($property in $localConfig.PSObject.Properties) {
-                if ($property.Name -eq "minimax" -and (Get-ObjectValue $config "minimax" $null)) {
-                    $miniMax = Get-ObjectValue $config "minimax" $null
-                    foreach ($miniMaxProperty in $property.Value.PSObject.Properties) {
-                        $miniMax | Add-Member -MemberType NoteProperty -Name $miniMaxProperty.Name -Value $miniMaxProperty.Value -Force
-                    }
-                } else {
-                    $config | Add-Member -MemberType NoteProperty -Name $property.Name -Value $property.Value -Force
-                }
-            }
+            $config = Merge-ConfigObject $config $localConfig
         } catch {
         }
     }
@@ -417,33 +691,45 @@ function Read-Config {
 function Build-ProviderContextMenu($window, $controls) {
     $menu = New-Object System.Windows.Controls.ContextMenu
 
-    $codexItem = New-Object System.Windows.Controls.MenuItem
-    $codexItem.Header = "Show Codex"
-    $codexItem.IsCheckable = $true
-    $codexItem.IsChecked = $script:CodexEnabled
-    $codexItem.Add_Click({
-        if ($script:CodexEnabled -and -not $script:MinimaxEnabled) {
-            return
+    foreach ($providerId in (Get-ProviderIds)) {
+        if (-not [bool](Get-ObjectValue $script:ProviderEnabledMap $providerId $false)) {
+            continue
         }
-        $script:CodexEnabled = -not $script:CodexEnabled
-        Sync-ProviderVisibility $controls
-        Sync-ProviderState
-    })
 
-    $minimaxItem = New-Object System.Windows.Controls.MenuItem
-    $minimaxItem.Header = "Show MiniMax"
-    $minimaxItem.IsCheckable = $true
-    $minimaxItem.IsChecked = $script:MinimaxEnabled
-    $minimaxItem.Add_Click({
-        if ($script:MinimaxEnabled -and -not $script:CodexEnabled) {
-            return
-        }
-        $script:MinimaxEnabled = -not $script:MinimaxEnabled
-        Sync-ProviderVisibility $controls
-        Sync-ProviderState
-    })
+        $metadata = Get-ProviderMetadata $providerId
+        $item = New-Object System.Windows.Controls.MenuItem
+        $item.Header = "Show {0}" -f $metadata.label
+        $item.IsCheckable = $true
+        $item.IsChecked = Test-ProviderVisible $providerId
+        $item.Tag = $providerId
+        $item.Add_Click({
+            param($sender)
+            $targetProviderId = [string]$sender.Tag
+            $currentlyVisible = Test-ProviderVisible $targetProviderId
+            if ($currentlyVisible -and -not (Test-CanHideProvider $targetProviderId)) {
+                return
+            }
+
+            Set-ProviderVisible $targetProviderId (-not $currentlyVisible)
+            $script:CodexEnabled = Test-ProviderVisible "codex"
+            $script:MinimaxEnabled = Test-ProviderVisible "minimax"
+            Sync-ProviderVisibility $controls
+            Sync-ProviderState
+        })
+        $menu.Items.Add($item) | Out-Null
+    }
 
     $separator = New-Object System.Windows.Controls.Separator
+
+    $displayLeftItem = New-Object System.Windows.Controls.MenuItem
+    $displayLeftItem.Header = Get-UsageDisplayToggleLabel
+    $displayLeftItem.Add_Click({
+        $script:UsageDisplayMode = if ((Normalize-UsageDisplayMode $script:UsageDisplayMode) -eq "left") { "used" } else { "left" }
+        if (-not (Apply-CachedUsageSnapshot $controls $script:UsageSnapshot)) {
+            Update-Widget $controls
+        }
+        Sync-ProviderState
+    })
 
     $topmostItem = New-Object System.Windows.Controls.MenuItem
     $topmostItem.Header = "Always on Top"
@@ -462,9 +748,8 @@ function Build-ProviderContextMenu($window, $controls) {
         $window.Close()
     })
 
-    $menu.Items.Add($codexItem) | Out-Null
-    $menu.Items.Add($minimaxItem) | Out-Null
     $menu.Items.Add($separator) | Out-Null
+    $menu.Items.Add($displayLeftItem) | Out-Null
     $menu.Items.Add($topmostItem) | Out-Null
     $menu.Items.Add($exitItem) | Out-Null
 
@@ -472,56 +757,46 @@ function Build-ProviderContextMenu($window, $controls) {
 }
 
 function Sync-ProviderVisibility($controls) {
-    $codexSection = $controls.CodexSection
-    $minimaxSection = $controls.MinimaxSection
-    $compactCodex = $controls.CompactCodex
-    $compactMinimax = $controls.CompactMinimax
-
-    if (-not $script:CodexEnabled -and -not $script:MinimaxEnabled) {
-        $script:CodexEnabled = $true
-    }
-
-    if ($script:CodexEnabled) {
-        $codexSection.Visibility = "Visible"
-        $compactCodex.panel.Visibility = "Visible"
-    } else {
-        $codexSection.Visibility = "Collapsed"
-        $compactCodex.panel.Visibility = "Collapsed"
-    }
-
-    if ($script:MinimaxEnabled) {
-        $minimaxSection.Visibility = "Visible"
-        $compactMinimax.panel.Visibility = "Visible"
-    } else {
-        $minimaxSection.Visibility = "Collapsed"
-        $compactMinimax.panel.Visibility = "Collapsed"
-    }
-
-    if ($script:CodexEnabled -and $script:MinimaxEnabled) {
-        $controls.CompactContent.ColumnDefinitions[0].Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
-        $controls.CompactContent.ColumnDefinitions[1].Width = [System.Windows.GridLength]::new(8)
-        $controls.CompactContent.ColumnDefinitions[2].Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
-        [System.Windows.Controls.Grid]::SetColumn($compactCodex.panel, 0)
-        [System.Windows.Controls.Grid]::SetColumn($compactMinimax.panel, 2)
-    } else {
-        $controls.CompactContent.ColumnDefinitions[0].Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
-        $controls.CompactContent.ColumnDefinitions[1].Width = [System.Windows.GridLength]::new(0)
-        $controls.CompactContent.ColumnDefinitions[2].Width = [System.Windows.GridLength]::new(0)
-        if ($script:CodexEnabled) {
-            [System.Windows.Controls.Grid]::SetColumn($compactCodex.panel, 0)
-        } else {
-            [System.Windows.Controls.Grid]::SetColumn($compactMinimax.panel, 0)
+    if ((Get-VisibleProviderIds).Count -eq 0) {
+        foreach ($providerId in (Get-ProviderIds)) {
+            if ([bool](Get-ObjectValue $script:ProviderEnabledMap $providerId $false)) {
+                Set-ProviderVisible $providerId $true
+                break
+            }
         }
     }
 
+    $script:CodexEnabled = Test-ProviderVisible "codex"
+    $script:MinimaxEnabled = Test-ProviderVisible "minimax"
+
+    $visibleIds = Get-VisibleProviderIds
+    foreach ($providerId in (Get-ProviderIds)) {
+        $isVisible = $visibleIds -contains $providerId
+        $fullControl = Get-ObjectValue $controls.ProviderSections $providerId $null
+        $compactControl = Get-ObjectValue $controls.CompactProviders $providerId $null
+
+        if ($fullControl) {
+            $fullControl.Section.Visibility = if ($isVisible) { "Visible" } else { "Collapsed" }
+            $fullControl.Section.Margin = if ($isVisible -and $providerId -ne $visibleIds[-1]) { "0,0,0,8" } else { "0,0,0,0" }
+        }
+
+        if ($compactControl) {
+            $compactControl.panel.Visibility = if ($isVisible) { "Visible" } else { "Collapsed" }
+            $compactControl.panel.Margin = if ($isVisible -and $providerId -ne $visibleIds[-1]) { "0,0,8,0" } else { "0,0,0,0" }
+        }
+    }
+
+    $controls.CompactContent.Columns = (Get-CompactLayoutMetrics $visibleIds.Count).Columns
     Set-WidgetMode $controls.Window $controls $script:CompactMode $false
 }
 
 function Sync-ProviderState {
     $state = Read-State
-    $state.providers.codex = $script:CodexEnabled
-    $state.providers.minimax = $script:MinimaxEnabled
+    foreach ($providerId in (Get-ProviderIds)) {
+        $state.providers[$providerId] = [bool](Get-ObjectValue $script:ProviderVisibility $providerId $false)
+    }
     $state | Add-Member -MemberType NoteProperty -Name compactMode -Value $script:CompactMode -Force
+    $state | Add-Member -MemberType NoteProperty -Name displayMode -Value (Normalize-UsageDisplayMode $script:UsageDisplayMode) -Force
     $state | Add-Member -MemberType NoteProperty -Name topmost -Value $script:TopmostEnabled -Force
 
     $json = $state | ConvertTo-Json -Depth 8
@@ -533,6 +808,11 @@ function Sync-ProviderState {
 
 function Save-State($window) {
     try {
+        $providerState = [ordered]@{}
+        foreach ($providerId in (Get-ProviderIds)) {
+            $providerState[$providerId] = [bool](Get-ObjectValue $script:ProviderVisibility $providerId $false)
+        }
+
         $state = [ordered]@{
             left = [Math]::Round($window.Left)
             top = [Math]::Round($window.Top)
@@ -540,16 +820,14 @@ function Save-State($window) {
             opacity = 1.0
             refreshSeconds = 3
             compactMode = $script:CompactMode
+            displayMode = Normalize-UsageDisplayMode $script:UsageDisplayMode
             usageSnapshot = $script:UsageSnapshot
             usageFloor = [ordered]@{
                 windowKey = if ($script:UsageFloorState.WindowKey) { [string]$script:UsageFloorState.WindowKey } else { "" }
                 primaryUsed = if ($null -ne $script:UsageFloorState.PrimaryUsed) { [double]$script:UsageFloorState.PrimaryUsed } else { $null }
                 secondaryUsed = if ($null -ne $script:UsageFloorState.SecondaryUsed) { [double]$script:UsageFloorState.SecondaryUsed } else { $null }
             }
-            providers = [ordered]@{
-                codex = $script:CodexEnabled
-                minimax = $script:MinimaxEnabled
-            }
+            providers = $providerState
         }
         $json = $state | ConvertTo-Json -Depth 8
         [System.IO.File]::WriteAllText($script:StatePath, $json, [System.Text.Encoding]::UTF8)
@@ -702,9 +980,50 @@ function Restore-UsageObjectSnapshot($snapshot) {
     }
 }
 
-function New-UsageSnapshot($codex, $minimax, $activity) {
+function New-ProviderUsageSnapshotMap($providers) {
+    $snapshot = [ordered]@{}
+
+    if (-not $providers) {
+        return $snapshot
+    }
+
+    foreach ($providerId in (Get-ProviderIds)) {
+        if ($providers.Contains($providerId)) {
+            $snapshot[$providerId] = New-UsageObjectSnapshot $providers[$providerId]
+        }
+    }
+
+    return $snapshot
+}
+
+function Restore-ProviderUsageSnapshotMap($providers) {
+    $restored = [ordered]@{}
+
+    if (-not $providers) {
+        return $restored
+    }
+
+    foreach ($providerId in (Get-ProviderIds)) {
+        $snapshot = Get-ObjectValue $providers $providerId $null
+        if ($null -ne $snapshot) {
+            $restored[$providerId] = Restore-UsageObjectSnapshot $snapshot
+        }
+    }
+
+    return $restored
+}
+
+function New-UsageSnapshot($codex, $minimax, $activity, $providers = $null) {
+    if (-not $providers) {
+        $providers = [ordered]@{
+            codex = $codex
+            minimax = $minimax
+        }
+    }
+
     return [ordered]@{
         savedAt = (Get-Date).ToString("o")
+        providers = New-ProviderUsageSnapshotMap $providers
         codex = New-UsageObjectSnapshot $codex
         minimax = New-UsageObjectSnapshot $minimax
         activity = [ordered]@{
@@ -723,9 +1042,13 @@ function Restore-UsageSnapshot($snapshot) {
 
     $activity = Get-ObjectValue $snapshot "activity" $null
     $observedAt = if ($activity) { Convert-ToDateTimeOrNull (Get-ObjectValue $activity "observedAt" $null) } else { $null }
+    $providers = Restore-ProviderUsageSnapshotMap (Get-ObjectValue $snapshot "providers" $null)
+    $codex = if ($providers.Contains("codex")) { $providers["codex"] } else { Restore-UsageObjectSnapshot (Get-ObjectValue $snapshot "codex" $null) }
+    $minimax = if ($providers.Contains("minimax")) { $providers["minimax"] } else { Restore-UsageObjectSnapshot (Get-ObjectValue $snapshot "minimax" $null) }
     return [pscustomobject]@{
-        Codex = Restore-UsageObjectSnapshot (Get-ObjectValue $snapshot "codex" $null)
-        Minimax = Restore-UsageObjectSnapshot (Get-ObjectValue $snapshot "minimax" $null)
+        Providers = $providers
+        Codex = $codex
+        Minimax = $minimax
         Activity = [pscustomobject]@{
             LatestCall = Restore-TokenUsageSnapshot (Get-ObjectValue $activity "latestCall" $null)
             LatestTurn = Restore-TokenUsageSnapshot (Get-ObjectValue $activity "latestTurn" $null)
@@ -1152,7 +1475,7 @@ function Get-MinimaxRemoteSettings {
         $modelPattern = Get-FirstObjectValue $minimax @("modelPattern", "quotaModelPattern")
     }
     if (-not $modelPattern) {
-        $modelPattern = "MiniMax-M*"
+        $modelPattern = "general"
     }
 
     return [pscustomobject]@{
@@ -1353,6 +1676,14 @@ function Get-MinimaxModelQuotaObject($root, $modelPattern) {
         }
         if ($matched) {
             $usableItems = $matched
+        } else {
+            $general = $usableItems | Where-Object {
+                $modelName = Get-FirstStringValue $_ @("model_name", "modelName", "name")
+                $modelName -and ($modelName -ieq "general")
+            }
+            if ($general) {
+                $usableItems = $general
+            }
         }
     }
 
@@ -1401,6 +1732,12 @@ function Convert-MinimaxQuotaWindow($source, $prefix, $defaultWindowMinutes, $al
     } else {
         $percent = Get-FirstNumberValue $source @("${prefix}_used_percent", "used_percent", "usage_percent", "usagePercentage")
     }
+    if ($null -eq $percent) {
+        $remainingPercent = Get-FirstNumberValue $source @("${prefix}_remaining_percent", "${prefix}_remains_percent", "remaining_percent", "remains_percent", "left_percent")
+        if ($null -ne $remainingPercent) {
+            $percent = 100 - $remainingPercent
+        }
+    }
 
     if ($null -eq $percent) {
         return $null
@@ -1444,7 +1781,7 @@ function Convert-MinimaxQuotaWindow($source, $prefix, $defaultWindowMinutes, $al
     }
 }
 
-function Convert-MinimaxQuota($raw, $sourceName, $modelPattern = "MiniMax-M*") {
+function Convert-MinimaxQuota($raw, $sourceName, $modelPattern = "general") {
     $root = Get-MinimaxPayloadRoot $raw
     $model = Get-MinimaxModelQuotaObject $root $modelPattern
     $primarySource = if ($model) { $model } else { $root }
@@ -2210,6 +2547,361 @@ function Get-MinimaxUsage {
     }
 }
 
+function Get-GrokSettings {
+    $config = Read-Config
+    $grok = Get-ProviderConfigObject $config "grok"
+
+    return [pscustomobject]@{
+        Enabled = Convert-ToBoolean (Get-ObjectValue $grok "enabled" $null) $false
+        LogPath = Get-FirstObjectValue $grok @("logPath", "log", "path", "billingLogPath")
+        StaleAfterSeconds = [Math]::Max(60, [int](Convert-ToNullableNumber (Get-ObjectValue $grok "staleAfterSeconds" $script:StaleAfterSeconds)))
+        ApiTimeoutSeconds = [Math]::Max(3, [int](Convert-ToNullableNumber (Get-ObjectValue $grok "apiTimeoutSeconds" 12)))
+    }
+}
+
+function Convert-ToUnixTimestamp($value) {
+    if ($null -eq $value) {
+        return [int64]0
+    }
+
+    if ($value -is [DateTime]) {
+        return ([DateTimeOffset]$value).ToUnixTimeSeconds()
+    }
+
+    $number = Convert-ToNullableNumber $value
+    if ($null -ne $number) {
+        if ($number -le 0) {
+            return [int64]0
+        }
+
+        if ($number -gt 9999999999) {
+            return [int64][Math]::Floor($number / 1000)
+        }
+
+        return [int64][Math]::Floor($number)
+    }
+
+    try {
+        return ([DateTimeOffset]::Parse($value.ToString(), [Globalization.CultureInfo]::InvariantCulture)).ToUnixTimeSeconds()
+    } catch {
+        return [int64]0
+    }
+}
+
+function Get-NewerUsage($primaryUsage, $fallbackUsage) {
+    if (-not $primaryUsage) {
+        return $fallbackUsage
+    }
+
+    if (-not $fallbackUsage) {
+        return $primaryUsage
+    }
+
+    $primaryUpdated = Convert-ToDateTimeOrNull (Get-ObjectValue $primaryUsage "updated" $null)
+    $fallbackUpdated = Convert-ToDateTimeOrNull (Get-ObjectValue $fallbackUsage "updated" $null)
+    if ($primaryUpdated -and $fallbackUpdated -and $fallbackUpdated -gt $primaryUpdated) {
+        return $fallbackUsage
+    }
+
+    return $primaryUsage
+}
+
+function Set-GrokUsageFreshness($usage, $staleAfterSeconds) {
+    if (-not $usage -or -not $usage.ok) {
+        return $usage
+    }
+
+    $updated = Convert-ToDateTimeOrNull (Get-ObjectValue $usage "updated" $null)
+    if (-not $updated) {
+        $updated = Get-Date
+        $usage.updated = $updated
+    }
+
+    $age = (Get-Date) - $updated
+    $usage.isStale = ($age.TotalSeconds -gt $staleAfterSeconds)
+    $usage.staleText = if ($usage.isStale) { "Updated {0}m ago" -f [Math]::Max(1, [Math]::Floor($age.TotalMinutes)) } else { "" }
+    return $usage
+}
+
+function Convert-GrokBillingConfigToUsage($config, $updatedValue = $null, $source = "local_log", $plan = "Grok") {
+    if (-not $config) {
+        return $null
+    }
+
+    $usedPercent = Convert-ToNullableNumber (Get-ObjectValue $config "creditUsagePercent" $null)
+    if ($null -eq $usedPercent) {
+        return $null
+    }
+
+    $currentPeriod = Get-ObjectValue $config "currentPeriod" $null
+    $periodStart = Get-ObjectValue $currentPeriod "start" (Get-ObjectValue $config "billingPeriodStart" $null)
+    $periodEnd = Get-ObjectValue $currentPeriod "end" (Get-ObjectValue $config "billingPeriodEnd" $null)
+    $startSeconds = Convert-ToUnixTimestamp $periodStart
+    $endSeconds = Convert-ToUnixTimestamp $periodEnd
+    $windowMinutes = if ($startSeconds -gt 0 -and $endSeconds -gt $startSeconds) {
+        [int][Math]::Max(1, [Math]::Round(($endSeconds - $startSeconds) / 60.0))
+    } else {
+        10080
+    }
+
+    $updated = Convert-ToDateTimeOrNull $updatedValue
+    if (-not $updated) {
+        $updated = Get-Date
+    }
+
+    return [pscustomobject]@{
+        ok = $true
+        configured = $true
+        message = $null
+        plan = if ([string]::IsNullOrWhiteSpace($plan)) { "Grok" } else { $plan }
+        source = $source
+        updated = $updated
+        isStale = $false
+        staleText = ""
+        error = $null
+        primary = [pscustomobject]@{
+            used_percent = [Math]::Max([double]0, [Math]::Min([double]100, [double]$usedPercent))
+            resets_at = $endSeconds
+            window_minutes = $windowMinutes
+            total = $null
+            remaining = $null
+            used = $null
+        }
+        secondary = $null
+    }
+}
+
+function Get-GrokClientVersion {
+    if (-not [string]::IsNullOrWhiteSpace($script:GrokClientVersion)) {
+        return $script:GrokClientVersion
+    }
+
+    try {
+        $versionOutput = & grok --version 2>$null | Select-Object -First 1
+        $match = [regex]::Match(($versionOutput -join " "), 'grok\s+([0-9]+\.[0-9]+\.[0-9]+)')
+        if ($match.Success) {
+            $script:GrokClientVersion = $match.Groups[1].Value
+            return $script:GrokClientVersion
+        }
+    } catch {
+    }
+
+    $script:GrokClientVersion = "0.2.82"
+    return $script:GrokClientVersion
+}
+
+function Resolve-GrokAuthContext($path = $script:GrokAuthPath) {
+    if (-not (Test-Path $path)) {
+        throw "Grok auth.json not found"
+    }
+
+    $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+    $keyMatch = [regex]::Match($raw, '"key"\s*:\s*"([^"]+)"')
+    $userIdMatch = [regex]::Match($raw, '"user_id"\s*:\s*"([^"]+)"')
+    if (-not $keyMatch.Success) {
+        throw "Grok auth key not found"
+    }
+
+    if (-not $userIdMatch.Success) {
+        throw "Grok auth user id not found"
+    }
+
+    return [pscustomobject]@{
+        Key = $keyMatch.Groups[1].Value
+        UserId = $userIdMatch.Groups[1].Value
+    }
+}
+
+function Convert-GrokBillingLogRecord($record) {
+    if (-not $record -or (Get-ObjectValue $record "msg" "") -ne "billing: fetched credits config") {
+        return $null
+    }
+
+    $ctx = Get-ObjectValue $record "ctx" $null
+    $config = Get-ObjectValue $ctx "config" $null
+    if (-not $config) {
+        return $null
+    }
+
+    return Convert-GrokBillingConfigToUsage $config (Get-ObjectValue $record "ts" $null) "local_log" (Get-ObjectValue $ctx "subscriptionTier" "Grok")
+}
+
+function Convert-GrokBillingApiResponse($response, $existingUsage = $null) {
+    if (-not $response) {
+        return $null
+    }
+
+    $config = Get-ObjectValue $response "config" $null
+    if (-not $config) {
+        return $null
+    }
+
+    $plan = Get-ObjectValue $response "subscriptionTier" $null
+    if ([string]::IsNullOrWhiteSpace($plan) -and $existingUsage) {
+        $plan = Get-ObjectValue $existingUsage "plan" $null
+    }
+
+    return Convert-GrokBillingConfigToUsage $config (Get-Date) "api" $plan
+}
+
+function Invoke-GrokLiveBillingFetch {
+    $settings = Get-GrokSettings
+    $auth = Resolve-GrokAuthContext
+    $headers = @{
+        Authorization = "Bearer {0}" -f $auth.Key
+        "x-userid" = $auth.UserId
+        "x-grok-client-version" = Get-GrokClientVersion
+    }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $response = Invoke-WebRequest -Uri $script:GrokBillingApiUrl -Headers $headers -Method Get -TimeoutSec $settings.ApiTimeoutSeconds -UseBasicParsing
+    $data = $response.Content | ConvertFrom-Json
+    $usage = Convert-GrokBillingApiResponse $data $script:GrokRemoteState.Usage
+    if (-not $usage) {
+        throw "Malformed Grok billing response"
+    }
+
+    return $usage
+}
+
+function Invoke-GrokRefreshCore($fetchOperation, $existingUsage = $null) {
+    try {
+        $usage = & $fetchOperation
+        if (-not $usage -or -not $usage.ok) {
+            throw "Grok API returned no usage snapshot"
+        }
+
+        return [pscustomobject]@{
+            Usage = $usage
+            Error = $null
+            Status = [pscustomobject]@{
+                state = "success"
+                summary = "api ok"
+                detail = "Grok usage refreshed via API"
+                updated = Get-Date
+            }
+        }
+    } catch {
+        return [pscustomobject]@{
+            Usage = $existingUsage
+            Error = $_.Exception.Message
+            Status = [pscustomobject]@{
+                state = "error"
+                summary = "api failed"
+                detail = $_.Exception.Message
+                updated = Get-Date
+            }
+        }
+    }
+}
+
+function Invoke-GrokManualRefresh($controls = $null) {
+    $result = Invoke-GrokRefreshCore { Invoke-GrokLiveBillingFetch } $script:GrokRemoteState.Usage
+    if ($result.Usage) {
+        $script:GrokRemoteState.Usage = Set-GrokUsageFreshness $result.Usage (Get-GrokSettings).StaleAfterSeconds
+        if ($result.Error) {
+            $script:GrokRemoteState.Usage.error = $result.Error
+        } else {
+            $script:GrokRemoteState.Usage.error = $null
+        }
+    }
+
+    $script:GrokRemoteState.Error = $result.Error
+    $script:GrokRemoteState.RefreshStatus = $result.Status
+    $null = Set-ProviderActionStatus "grok" $result.Status.state $result.Status.summary $result.Status.detail
+    if ($result.Error) {
+        Write-WidgetLog ("Grok API refresh failed: {0}" -f $result.Error)
+    } elseif ($result.Usage -and $result.Usage.primary) {
+        Write-WidgetLog ("Grok API refresh succeeded: weekly {0:N1}%." -f [double]$result.Usage.primary.used_percent)
+    }
+
+    if ($controls) {
+        Update-Widget $controls
+    }
+
+    return $result
+}
+
+function Read-GrokBillingUsageFromLog($path) {
+    if (-not $path) {
+        $path = $script:GrokLogsPath
+    }
+
+    if (-not (Test-Path $path)) {
+        return $null
+    }
+
+    $lines = Get-Content $path -Tail 250 -ErrorAction SilentlyContinue
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        $line = $lines[$i]
+        if ([string]::IsNullOrWhiteSpace($line) -or $line -notmatch 'billing: fetched credits config') {
+            continue
+        }
+
+        try {
+            $record = $line | ConvertFrom-Json
+            $usage = Convert-GrokBillingLogRecord $record
+            if ($usage) {
+                return $usage
+            }
+        } catch {
+        }
+    }
+
+    return $null
+}
+
+function Get-GrokUsage {
+    $settings = Get-GrokSettings
+    if (-not $settings.Enabled) {
+        return [pscustomobject]@{
+            ok = $false
+            configured = $false
+            message = "Grok not configured"
+            plan = "unknown"
+            updated = Get-Date
+            primary = $null
+            secondary = $null
+        }
+    }
+
+    $logPath = if ($settings.LogPath) { $settings.LogPath } else { $script:GrokLogsPath }
+
+    try {
+        $logUsage = Read-GrokBillingUsageFromLog $logPath
+        if (-not $logUsage) {
+            throw "No Grok billing snapshot found"
+        }
+
+        $usage = Get-NewerUsage $logUsage $script:GrokRemoteState.Usage
+        $usage = Set-GrokUsageFreshness $usage $settings.StaleAfterSeconds
+
+        if ($usage -ne $script:GrokRemoteState.Usage) {
+            $script:GrokRemoteState.Usage = $usage
+        }
+        $script:GrokRemoteState.Error = $null
+        return $usage
+    } catch {
+        $script:GrokRemoteState.Error = $_.Exception.Message
+        if ($script:GrokRemoteState.Usage) {
+            $script:GrokRemoteState.Usage = Set-GrokUsageFreshness $script:GrokRemoteState.Usage $settings.StaleAfterSeconds
+            $script:GrokRemoteState.Usage.error = $_.Exception.Message
+            return $script:GrokRemoteState.Usage
+        }
+
+        return [pscustomobject]@{
+            ok = $false
+            configured = $true
+            message = "Grok usage unavailable"
+            plan = "unknown"
+            updated = Get-Date
+            error = $_.Exception.Message
+            primary = $null
+            secondary = $null
+        }
+    }
+}
+
 function Set-Progress($row, $percent) {
     $safePercent = [Math]::Max([double]0, [Math]::Min([double]100, [double]$percent))
     $row.percent = $safePercent
@@ -2266,11 +2958,20 @@ function New-LimitRow($title, $large, $timeSegments) {
     $titleBlock = New-TextBlock $title $titleSize "SemiBold" "#F1F5F7"
     $titleBlock.Opacity = 0.76
     $value = New-TextBlock "%0" $valueSize "Light" "#9DFF58"
-    $value.Margin = "12,0,2,0"
-    [System.Windows.Controls.Grid]::SetColumn($value, 1)
+    $value.Margin = "12,0,0,0"
+    $mode = New-TextBlock "used" 8.5 "SemiBold" "#D0D5D6"
+    $mode.Margin = "6,4,2,0"
+    $mode.Opacity = 0.66
+
+    $valueWrap = New-Object System.Windows.Controls.StackPanel
+    $valueWrap.Orientation = "Horizontal"
+    $valueWrap.HorizontalAlignment = "Right"
+    $valueWrap.Children.Add($value) | Out-Null
+    $valueWrap.Children.Add($mode) | Out-Null
+    [System.Windows.Controls.Grid]::SetColumn($valueWrap, 1)
 
     $header.Children.Add($titleBlock) | Out-Null
-    $header.Children.Add($value) | Out-Null
+    $header.Children.Add($valueWrap) | Out-Null
 
     $track = New-Object System.Windows.Controls.Border
     $track.Height = $barHeight
@@ -2370,6 +3071,7 @@ function New-LimitRow($title, $large, $timeSegments) {
         panel = $panel
         title = $titleBlock
         value = $value
+        mode = $mode
         track = $track
         fill = $fill
         reset = $reset
@@ -2512,58 +3214,235 @@ function New-CompactProviderPanel($name, $accentColor) {
     return $panel
 }
 
+function New-ProviderSection($metadata) {
+    $section = New-Object System.Windows.Controls.Border
+    $section.Margin = "0,0,0,8"
+    $section.Padding = "0"
+    $section.BorderThickness = 1
+    $section.CornerRadius = 10
+    $section.BorderBrush = Get-Brush $metadata.accent
+    $section.BorderBrush.Opacity = 0.35
+    $section.Background = [System.Windows.Media.Brushes]::Transparent
+
+    $inner = New-Object System.Windows.Controls.StackPanel
+    $inner.Margin = "10,8,10,8"
+
+    $header = New-Object System.Windows.Controls.Grid
+    $header.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
+    $header.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
+    $header.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
+    $header.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
+
+    $label = New-TextBlock $metadata.title 9.5 "SemiBold" $metadata.accent
+    $label.Opacity = 0.85
+    $updated = New-TextBlock "not updated" 9 "Regular" "#AAB7BD"
+    $updated.Margin = "8,0,0,0"
+    $updated.Opacity = 0.62
+    [System.Windows.Controls.Grid]::SetColumn($updated, 1)
+
+    $actionButton = $null
+    if ($metadata.supportsRefresh) {
+        $actionButton = New-Object System.Windows.Controls.Button
+        $actionButton.Content = "↻"
+        $actionButton.FontSize = 8
+        $actionButton.FontWeight = "SemiBold"
+        $actionButton.Width = 28
+        $actionButton.Height = 18
+        $actionButton.Padding = "0"
+        $actionButton.Margin = "6,0,0,0"
+        $actionButton.VerticalAlignment = "Center"
+        $actionButton.Background = Get-Brush "#1E2730"
+        $actionButton.Foreground = Get-Brush $metadata.accent
+        $actionButton.BorderBrush = Get-Brush $metadata.accent
+        $actionButton.BorderBrush.Opacity = 0.35
+        $actionButton.Visibility = "Visible"
+        $actionButton.ToolTip = Get-ObjectValue $metadata "actionToolTip" "Refresh"
+        $actionButton.Content = Get-ObjectValue $metadata "actionLabel" "API"
+        [System.Windows.Controls.Grid]::SetColumn($actionButton, 3)
+    }
+
+    $header.Children.Add($label) | Out-Null
+    $header.Children.Add($updated) | Out-Null
+    if ($actionButton) {
+        $header.Children.Add($actionButton) | Out-Null
+    }
+
+    $rows = @()
+    foreach ($windowTitle in $metadata.defaultWindows) {
+        $row = New-LimitRow $windowTitle $false 7
+        $rows += $row
+        $inner.Children.Add($row.panel) | Out-Null
+    }
+
+    $inner.Children.Insert(0, $header)
+
+    $activityBlock = $null
+    if ([bool](Get-ObjectValue $metadata "showActivityBlock" $false)) {
+        $activityBlock = New-TextBlock "Last activity: waiting for token details" 9 "Regular" "#E2E9EC"
+        $activityBlock.Margin = "0,6,0,0"
+        $activityBlock.Opacity = 0.74
+        $inner.Children.Add($activityBlock) | Out-Null
+    }
+
+    $hintBlock = $null
+    if ($metadata.supportsHint) {
+        $hintBlock = New-TextBlock "Usage pace looks balanced." 9.5 "Regular" "#D6E2E8"
+        $hintBlock.Margin = "0,2,0,0"
+        $hintBlock.Opacity = 0.78
+        $inner.Children.Add($hintBlock) | Out-Null
+    }
+
+    $section.Child = $inner
+
+    return [pscustomobject]@{
+        Metadata = $metadata
+        Section = $section
+        Header = $header
+        Updated = $updated
+        ActionButton = $actionButton
+        Rows = $rows
+        Activity = $activityBlock
+        Hint = $hintBlock
+    }
+}
+
 function Format-CompactRemaining($resetSeconds) {
     $text = Format-Remaining $resetSeconds
     return $text -replace " left$", ""
 }
 
-function Format-CompactTooltip($name, $usage, $activity) {
-    if (-not $usage -or -not $usage.ok -or -not $usage.primary -or -not $usage.secondary) {
-        return "{0}: waiting for telemetry" -f $name
+function Get-ProviderUsageWindows($metadata, $usage) {
+    $windows = @()
+    $defaultTitles = @($metadata.defaultWindows)
+
+    if ($usage -and $usage.primary) {
+        $windows += [pscustomobject]@{
+            title = if ($defaultTitles.Count -ge 1) { $defaultTitles[0] } else { "LIMIT" }
+            limit = $usage.primary
+        }
     }
 
-    $lines = @(
-        ("{0} current: {1:N0}% ({2})" -f $name, [double]$usage.primary.used_percent, (Format-Remaining $usage.primary.resets_at)),
-        ("{0} weekly: {1:N0}% ({2})" -f $name, [double]$usage.secondary.used_percent, (Format-Remaining $usage.secondary.resets_at))
-    )
+    if ($usage -and $usage.secondary) {
+        $windows += [pscustomobject]@{
+            title = if ($defaultTitles.Count -ge 2) { $defaultTitles[1] } else { "WEEKLY" }
+            limit = $usage.secondary
+        }
+    }
+
+    return $windows
+}
+
+function Format-CompactTooltip($metadata, $usage, $activity) {
+    if (-not $usage -or -not $usage.ok -or -not $usage.primary) {
+        return "{0}: waiting for telemetry" -f $metadata.label
+    }
+
+    $lines = @()
+    foreach ($window in (Get-ProviderUsageWindows $metadata $usage)) {
+        $label = $window.title.ToLowerInvariant()
+        $display = Get-UsageDisplayData $window.limit.used_percent
+        $lines += ("{0} {1}: {2:N0}% {3} ({4})" -f $metadata.label, $label, [double]$display.percent, $display.mode, (Format-Remaining $window.limit.resets_at))
+    }
 
     if ($usage.isStale) {
         $lines += "Telemetry may be stale."
     }
 
-    if ($name -eq "Codex") {
+    if ($metadata.supportsActivity) {
         $lines += Format-ActivityTooltip $usage $activity
     }
 
     return $lines -join [Environment]::NewLine
 }
 
-function Update-CompactProviderPanel($panel, $usage, $name, $activity) {
+function Update-CompactProviderPanel($panel, $metadata, $usage, $activity) {
     if (-not $usage -or -not $usage.ok -or -not $usage.primary) {
         $panel.percentText.Text = "--"
         $panel.timeText.Text = "waiting"
-        $panel.weeklyText.Text = "W --"
-        $panel.panel.ToolTip = "{0}: waiting for telemetry" -f $name
+        $panel.weeklyText.Text = ""
+        $panel.panel.ToolTip = "{0}: waiting for telemetry" -f $metadata.label
         Set-CompactAccent $panel 0 $false
         Set-CompactWeeklyAccent $panel 0 $false
         Set-CompactProgress $panel 0
         return
     }
 
-    $percent = [Math]::Round([double]$usage.primary.used_percent)
-    $weeklyPercent = if ($usage.secondary) { [Math]::Round([double]$usage.secondary.used_percent) } else { $null }
+    $primaryDisplay = Get-UsageDisplayData $usage.primary.used_percent
+    $weeklyDisplay = if ($usage.secondary) { Get-UsageDisplayData $usage.secondary.used_percent } else { $null }
+    $percent = [Math]::Round([double]$primaryDisplay.percent)
+    $weeklyPercent = if ($weeklyDisplay) { [Math]::Round([double]$weeklyDisplay.percent) } else { $null }
     $panel.percentText.Text = "$percent%"
     $panel.timeText.Text = Format-CompactRemaining $usage.primary.resets_at
-    $panel.weeklyText.Text = if ($null -ne $weeklyPercent) { "W $weeklyPercent%" } else { "W --" }
-    $panel.panel.ToolTip = Format-CompactTooltip $name $usage $activity
-    Set-CompactAccent $panel $percent $true
-    Set-CompactWeeklyAccent $panel $weeklyPercent ($null -ne $weeklyPercent)
+    $panel.weeklyText.Text = if ($null -ne $weeklyPercent) { "W $weeklyPercent%" } else { "" }
+    $panel.panel.ToolTip = Format-CompactTooltip $metadata $usage $activity
+    Set-CompactAccent $panel $primaryDisplay.accentPercent $true
+    $weeklyAccentPercent = if ($weeklyDisplay) { $weeklyDisplay.accentPercent } else { $null }
+    Set-CompactWeeklyAccent $panel $weeklyAccentPercent ($null -ne $weeklyPercent)
     Set-CompactProgress $panel $percent
+}
+
+function Update-ProviderSection($control, $usage, $activity) {
+    $metadata = $control.Metadata
+    $windows = @(Get-ProviderUsageWindows $metadata $usage)
+    Update-ProviderActionButton $control
+
+    if (-not $usage -or -not $usage.ok -or $windows.Count -eq 0) {
+        for ($i = 0; $i -lt $control.Rows.Count; $i++) {
+            $row = $control.Rows[$i]
+            $row.panel.Visibility = "Visible"
+            if ($i -eq 0) {
+                Update-LimitRow $row $null ("Waiting for {0}" -f $metadata.label) "No fresh data"
+            } else {
+                Update-LimitRow $row $null "" ""
+            }
+        }
+
+        if ($control.Hint) {
+            $hint = if ($metadata.id -eq "codex") { Get-UsageHint $null $null $false } else { [pscustomobject]@{ Text = "Waiting for telemetry."; Color = "#D6E2E8" } }
+            $control.Hint.Text = $hint.Text
+            $control.Hint.Foreground = Get-Brush $hint.Color
+        }
+
+        if ($control.Activity) {
+            $control.Activity.Text = Format-ActivityText $null $activity
+            $control.Activity.ToolTip = Format-ActivityTooltip $null $activity
+        }
+
+        $control.Updated.Text = Format-ProviderUpdatedText $usage $metadata.id
+        return
+    }
+
+    for ($i = 0; $i -lt $control.Rows.Count; $i++) {
+        $row = $control.Rows[$i]
+        if ($i -lt $windows.Count) {
+            $window = $windows[$i]
+            $row.panel.Visibility = "Visible"
+            $resetText = if ($i -eq 0 -and $metadata.id -eq "codex") { Format-BaliReset $window.limit.resets_at } else { Format-LocalReset $window.limit.resets_at }
+            $timeText = Format-Remaining $window.limit.resets_at
+            Update-LimitRow $row $window.limit $resetText $timeText
+        } else {
+            $row.panel.Visibility = "Collapsed"
+        }
+    }
+
+    if ($control.Hint -and $metadata.id -eq "codex") {
+        $hint = Get-UsageHint $usage.primary $usage.secondary $usage.isStale $usage.limitReachedType
+        $control.Hint.Text = $hint.Text
+        $control.Hint.Foreground = Get-Brush $hint.Color
+    }
+
+    if ($control.Activity) {
+        $control.Activity.Text = Format-ActivityText $usage $activity
+        $control.Activity.ToolTip = Format-ActivityTooltip $usage $activity
+    }
+
+    $control.Updated.Text = Format-ProviderUpdatedText $usage $metadata.id
 }
 
 function Update-LimitRow($row, $limit, $resetText, $timeText) {
     if (-not $limit) {
         $row.value.Text = "--"
+        $row.mode.Text = Normalize-UsageDisplayMode $script:UsageDisplayMode
         $row.reset.Text = $resetText
         $row.left.Text = $timeText
         Set-LimitAccent $row 0 $false
@@ -2572,12 +3451,14 @@ function Update-LimitRow($row, $limit, $resetText, $timeText) {
         return
     }
 
-    $percent = [Math]::Round([double]$limit.used_percent)
+    $display = Get-UsageDisplayData $limit.used_percent
+    $percent = [Math]::Round([double]$display.percent)
     $row.value.Text = "%$percent"
+    $row.mode.Text = $display.mode
     $row.value.UpdateLayout()
     $row.reset.Text = $resetText
     $row.left.Text = $timeText
-    Set-LimitAccent $row $percent $true
+    Set-LimitAccent $row $display.accentPercent $true
     Set-Progress $row $percent
     Set-TimeProgress $row (Get-TimeLeftPercent $limit)
 }
@@ -2589,10 +3470,29 @@ function Show-UsageWindow($window) {
 }
 
 function Get-VisibleProviderCount {
-    $count = 0
-    if ($script:CodexEnabled) { $count++ }
-    if ($script:MinimaxEnabled) { $count++ }
-    return [Math]::Max(1, $count)
+    return [Math]::Max(1, (Get-VisibleProviderIds).Count)
+}
+
+function Get-CompactColumnCount($visibleProviderCount) {
+    $count = [Math]::Max(1, [int]$visibleProviderCount)
+    if ($count -le 1) {
+        return 1
+    }
+
+    return 2
+}
+
+function Get-CompactLayoutMetrics($visibleProviderCount) {
+    $count = [Math]::Max(1, [int]$visibleProviderCount)
+    $columns = Get-CompactColumnCount $count
+    $rows = [int][Math]::Ceiling($count / [double]$columns)
+
+    return [pscustomobject]@{
+        Columns = $columns
+        Rows = $rows
+        Width = if ($columns -le 1) { $script:CompactSingleWidth } else { $script:CompactDoubleWidth }
+        Height = if ($rows -le 1) { $script:CompactHeight } else { $script:CompactMultiRowHeight }
+    }
 }
 
 function Get-FullWidgetHeight($controls) {
@@ -2650,14 +3550,15 @@ function Set-WidgetMode($window, $controls, $compact, $saveState = $true, $prese
         $controls.Outer.Padding = "8,4,8,4"
         $controls.Outer.CornerRadius = 14
 
-        $width = if ((Get-VisibleProviderCount) -gt 1) { $script:CompactDoubleWidth } else { $script:CompactSingleWidth }
+        $compactLayout = Get-CompactLayoutMetrics (Get-VisibleProviderCount)
+        $width = $compactLayout.Width
         $window.SizeToContent = "Manual"
         $window.Width = $width
         $window.MinWidth = $width
         $window.MaxWidth = $width
-        $window.Height = $script:CompactHeight
-        $window.MinHeight = $script:CompactHeight
-        $window.MaxHeight = $script:CompactHeight
+        $window.Height = $compactLayout.Height
+        $window.MinHeight = $compactLayout.Height
+        $window.MaxHeight = $compactLayout.Height
     } else {
         $controls.CompactContent.Visibility = "Collapsed"
         $controls.FullContent.Visibility = "Visible"
@@ -2691,61 +3592,102 @@ function Toggle-WidgetMode($window, $controls) {
     Set-WidgetMode $window $controls (-not $script:CompactMode) $true $wasCompact
 }
 
-function Format-ProviderUpdatedText($usage) {
-    if (-not $usage -or -not $usage.ok -or -not $usage.updated) {
-        return "not updated"
+function Get-ProviderActionSummary($providerId) {
+    $status = Get-ProviderActionStatus $providerId
+    if (-not $status) {
+        return $null
     }
 
-    $updated = Convert-ToDateTimeOrNull $usage.updated
-    if (-not $updated) {
-        return "not updated"
+    $updated = Convert-ToDateTimeOrNull (Get-ObjectValue $status "updated" $null)
+    if ($updated) {
+        $age = (Get-Date) - $updated
+        if ($status.state -eq "success" -and $age.TotalSeconds -gt 90) {
+            return $null
+        }
+
+        if ($status.state -eq "error" -and $age.TotalSeconds -gt 180) {
+            return $null
+        }
     }
 
-    return $updated.ToString("HH:mm:ss")
+    return Get-ObjectValue $status "summary" $null
 }
 
-function Apply-WidgetData($controls, $usage, $minimax, $activity) {
-    if (-not $usage -or -not $usage.ok -or -not $usage.primary -or -not $usage.secondary) {
-        Update-LimitRow $controls.Current $null "Waiting for Codex" "No fresh data"
-        Update-LimitRow $controls.Weekly $null "Waiting for Codex" ""
-        $hint = Get-UsageHint $null $null $false
-        $controls.CodexHint.Text = $hint.Text
-        $controls.CodexHint.Foreground = Get-Brush $hint.Color
-        $controls.CodexActivity.Text = Format-ActivityText $null $activity
-        $controls.CodexActivity.ToolTip = Format-ActivityTooltip $null $activity
-        Update-CompactProviderPanel $controls.CompactCodex $null "Codex" $activity
-    } else {
-        $currentReset = Format-BaliReset $usage.primary.resets_at
-        $currentLeft = Format-Remaining $usage.primary.resets_at
-        $weeklyReset = Format-LocalReset $usage.secondary.resets_at
-        $weeklyLeft = Format-Remaining $usage.secondary.resets_at
-        Update-LimitRow $controls.Current $usage.primary $currentReset $currentLeft
-        Update-LimitRow $controls.Weekly $usage.secondary $weeklyReset $weeklyLeft
-
-        $hint = Get-UsageHint $usage.primary $usage.secondary $usage.isStale $usage.limitReachedType
-        $controls.CodexHint.Text = $hint.Text
-        $controls.CodexHint.Foreground = Get-Brush $hint.Color
-        $controls.CodexActivity.Text = Format-ActivityText $usage $activity
-        $controls.CodexActivity.ToolTip = Format-ActivityTooltip $usage $activity
-        Update-CompactProviderPanel $controls.CompactCodex $usage "Codex" $activity
+function Get-ProviderActionToolTip($providerId, $defaultToolTip) {
+    $status = Get-ProviderActionStatus $providerId
+    if (-not $status) {
+        return $defaultToolTip
     }
 
-    if ($minimax -and $minimax.ok -and $minimax.primary -and $minimax.secondary) {
-        $currentReset = Format-LocalReset $minimax.primary.resets_at
-        $currentLeft = Format-Remaining $minimax.primary.resets_at
-        $weeklyReset = Format-LocalReset $minimax.secondary.resets_at
-        $weeklyLeft = Format-Remaining $minimax.secondary.resets_at
-        Update-LimitRow $controls.MinimaxCurrent $minimax.primary $currentReset $currentLeft
-        Update-LimitRow $controls.MinimaxWeekly $minimax.secondary $weeklyReset $weeklyLeft
-    } else {
-        Update-LimitRow $controls.MinimaxCurrent $null "Waiting for Minimax" ""
-        Update-LimitRow $controls.MinimaxWeekly $null "" ""
+    return Get-ObjectValue $status "detail" $defaultToolTip
+}
+
+function Update-ProviderActionButton($control) {
+    if (-not $control -or -not $control.ActionButton) {
+        return
     }
 
-    Update-CompactProviderPanel $controls.CompactMinimax $minimax "MiniMax" $null
-    $controls.CodexUpdated.Text = Format-ProviderUpdatedText $usage
-    $controls.MinimaxUpdated.Text = Format-ProviderUpdatedText $minimax
-    $controls.Updated.Text = if ($usage -and $usage.ok) { "Updated " + (Format-ProviderUpdatedText $usage) } else { "Updated " + (Get-Date).ToString("HH:mm:ss") }
+    $button = $control.ActionButton
+    $metadata = $control.Metadata
+    $status = Get-ProviderActionStatus $metadata.id
+    $button.IsEnabled = (-not $status -or $status.state -ne "running")
+    $button.Content = if ($status -and $status.state -eq "running") { "..." } else { Get-ObjectValue $metadata "actionLabel" "API" }
+    $button.ToolTip = Get-ProviderActionToolTip $metadata.id (Get-ObjectValue $metadata "actionToolTip" "Refresh")
+}
+
+function Format-ProviderUpdatedText($usage, $providerId = $null) {
+    if (-not $usage -or -not $usage.ok -or -not $usage.updated) {
+        $baseText = "not updated"
+    } else {
+        $updated = Convert-ToDateTimeOrNull $usage.updated
+        if (-not $updated) {
+            $baseText = "not updated"
+        } else {
+            $baseText = $updated.ToString("HH:mm:ss")
+        }
+    }
+
+    if (-not $providerId) {
+        return $baseText
+    }
+
+    $actionSummary = Get-ProviderActionSummary $providerId
+    if ([string]::IsNullOrWhiteSpace($actionSummary)) {
+        return $baseText
+    }
+
+    if ($baseText -eq "not updated") {
+        return $actionSummary
+    }
+
+    return "{0} / {1}" -f $baseText, $actionSummary
+}
+
+function Apply-WidgetData($controls, $usage, $minimax, $activity, $grok = $null) {
+    $providerUsageMap = [ordered]@{
+        codex = $usage
+        minimax = $minimax
+        grok = $grok
+    }
+
+    foreach ($providerId in (Get-ProviderIds)) {
+        $metadata = Get-ProviderMetadata $providerId
+        $providerUsage = Get-ObjectValue $providerUsageMap $providerId $null
+        $providerActivity = if ($metadata.supportsActivity) { $activity } else { $null }
+        $fullControl = Get-ObjectValue $controls.ProviderSections $providerId $null
+        $compactControl = Get-ObjectValue $controls.CompactProviders $providerId $null
+
+        if ($fullControl) {
+            Update-ProviderSection $fullControl $providerUsage $providerActivity
+        }
+
+        if ($compactControl) {
+            Update-CompactProviderPanel $compactControl $metadata $providerUsage $providerActivity
+        }
+    }
+
+    $statusUsage = @($usage, $minimax, $grok) | Where-Object { $_ -and $_.ok } | Select-Object -First 1
+    $controls.Updated.Text = if ($statusUsage) { "Updated " + (Format-ProviderUpdatedText $statusUsage) } else { "Updated " + (Get-Date).ToString("HH:mm:ss") }
 }
 
 function Apply-CachedUsageSnapshot($controls, $snapshot) {
@@ -2754,23 +3696,63 @@ function Apply-CachedUsageSnapshot($controls, $snapshot) {
         return $false
     }
 
-    Apply-WidgetData $controls $restored.Codex $restored.Minimax $restored.Activity
+    $grok = if ($restored.Providers) { Get-ObjectValue $restored.Providers "grok" $null } else { $null }
+    Apply-WidgetData $controls $restored.Codex $restored.Minimax $restored.Activity $grok
     return $true
+}
+
+function Invoke-ProviderRefreshAction($providerId, $controls) {
+    $metadata = Get-ProviderMetadata $providerId
+    if (-not $metadata -or -not $metadata.supportsRefresh) {
+        return
+    }
+
+    $status = Get-ProviderActionStatus $providerId
+    if ($status -and $status.state -eq "running") {
+        return
+    }
+
+    $null = Set-ProviderActionStatus $providerId "running" "api..." "Checking provider API"
+    $control = Get-ObjectValue $controls.ProviderSections $providerId $null
+    if ($control) {
+        Update-ProviderActionButton $control
+        $control.Updated.Text = Format-ProviderUpdatedText $script:GrokRemoteState.Usage $providerId
+        try {
+            $controls.Window.Dispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::Render)
+        } catch {
+        }
+    }
+
+    switch ($providerId) {
+        "grok" {
+            Invoke-GrokManualRefresh $controls | Out-Null
+        }
+    }
 }
 
 function Update-Widget($controls) {
     $usage = Get-CodexUsage
     $activity = Get-TokenActivitySummary
-    $minimax = if ($script:MinimaxEnabled) {
+    $minimax = if ([bool](Get-ObjectValue $script:ProviderEnabledMap "minimax" $false)) {
         Get-MinimaxUsage
     } else {
         $script:MinimaxRemoteState.Usage
     }
+    $grok = if ([bool](Get-ObjectValue $script:ProviderEnabledMap "grok" $false)) {
+        Get-GrokUsage
+    } else {
+        $script:GrokRemoteState.Usage
+    }
 
-    Apply-WidgetData $controls $usage $minimax $activity
+    Apply-WidgetData $controls $usage $minimax $activity $grok
 
-    if (($usage -and $usage.ok) -or ($minimax -and $minimax.ok)) {
-        $script:UsageSnapshot = New-UsageSnapshot $usage $minimax $activity
+    if (($usage -and $usage.ok) -or ($minimax -and $minimax.ok) -or ($grok -and $grok.ok)) {
+        $providerUsageMap = [ordered]@{
+            codex = $usage
+            minimax = $minimax
+            grok = $grok
+        }
+        $script:UsageSnapshot = New-UsageSnapshot $usage $minimax $activity $providerUsageMap
         Save-State $controls.Window
     }
 }
@@ -2842,7 +3824,7 @@ function Stop-CodexSessionWatcher {
 
 function New-TrayIcon($window) {
     $tray = New-Object System.Windows.Forms.NotifyIcon
-    $tray.Text = "Codex Usage Meter"
+    $tray.Text = "AI Usage Meter"
     if (Test-Path $script:IconPath) {
         $tray.Icon = New-Object System.Drawing.Icon $script:IconPath
     } else {
@@ -2851,10 +3833,8 @@ function New-TrayIcon($window) {
     $tray.Visible = $true
 
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
-    $showItem = New-Object System.Windows.Forms.ToolStripMenuItem "Show"
-    $dashboardItem = New-Object System.Windows.Forms.ToolStripMenuItem "Open Codex Usage Dashboard"
+    $dashboardItem = New-Object System.Windows.Forms.ToolStripMenuItem "Codex Usage Dashboard"
     $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem "Exit"
-    $menu.Items.Add($showItem) | Out-Null
     $menu.Items.Add($dashboardItem) | Out-Null
     $menu.Items.Add($exitItem) | Out-Null
     $tray.ContextMenuStrip = $menu
@@ -2863,8 +3843,6 @@ function New-TrayIcon($window) {
     $showAction = {
         Show-UsageWindow $window
     }
-
-    $showItem.Add_Click($showAction)
     $dashboardItem.Add_Click({
         [System.Diagnostics.Process]::Start($script:CodexUsageDashboardUrl) | Out-Null
     })
@@ -2877,22 +3855,21 @@ function New-TrayIcon($window) {
 
 function Build-Widget {
     $state = Read-State
+    $config = Read-Config
+    $script:ProviderEnabledMap = Get-ProviderEnabledMap $config
+    $script:ProviderVisibility = Normalize-ProviderVisibilityMap (Get-ObjectValue $state "providers" $null) $script:ProviderEnabledMap
     Initialize-UsageFloorState $state
 
-    # Load provider visibility state
-    if ($state.providers) {
-        $script:CodexEnabled = [bool]$state.providers.codex
-        $script:MinimaxEnabled = [bool]$state.providers.minimax
-    }
-    if (-not $script:CodexEnabled -and -not $script:MinimaxEnabled) {
-        $script:CodexEnabled = $true
-    }
+    # Compatibility bridge until rendering moves fully to the shared provider model.
+    $script:CodexEnabled = Test-ProviderVisible "codex"
+    $script:MinimaxEnabled = Test-ProviderVisible "minimax"
     $script:CompactMode = [bool](Get-ObjectValue $state "compactMode" $false)
+    $script:UsageDisplayMode = Normalize-UsageDisplayMode (Get-ObjectValue $state "displayMode" "used")
     $script:TopmostEnabled = [bool](Get-ObjectValue $state "topmost" $true)
     $script:UsageSnapshot = Get-ObjectValue $state "usageSnapshot" $null
 
     $window = New-Object System.Windows.Window
-    $window.Title = "Codex Usage Meter"
+    $window.Title = "AI Usage Meter"
     if (Test-Path $script:IconPath) {
         $iconStream = [System.IO.File]::OpenRead($script:IconPath)
         $window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create($iconStream)
@@ -2938,109 +3915,28 @@ function Build-Widget {
     $content.Margin = "0,0,0,0"
     [System.Windows.Controls.Grid]::SetRow($content, 0)
 
-    # Vertical layout: Codex on top, Minimax below
-    $sectionsGrid = New-Object System.Windows.Controls.Grid
-    $sectionsGrid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition))
-    $sectionsGrid.RowDefinitions.Add((New-Object System.Windows.Controls.RowDefinition -Property @{ Height = "Auto" }))
-    $sectionsGrid.Margin = "0,0,0,4"
+    $sectionsPanel = New-Object System.Windows.Controls.StackPanel
+    $sectionsPanel.Margin = "0,0,0,4"
+    $providerSections = [ordered]@{}
+    foreach ($providerId in (Get-ProviderIds)) {
+        $metadata = Get-ProviderMetadata $providerId
+        $providerSection = New-ProviderSection $metadata
+        $providerSections[$providerId] = $providerSection
+        $sectionsPanel.Children.Add($providerSection.Section) | Out-Null
+    }
 
-    # Codex section with cyan border
-    $codexSection = New-Object System.Windows.Controls.Border
-    $codexSection.Margin = "0,0,0,0"
-    $codexSection.Padding = "0"
-    $codexSection.BorderThickness = 1
-    $codexSection.CornerRadius = 10
-    $codexSection.BorderBrush = Get-Brush "#6FE8FF"
-    $codexSection.BorderBrush.Opacity = 0.35
-    $codexSection.Background = [System.Windows.Media.Brushes]::Transparent
+    $content.Children.Add($sectionsPanel) | Out-Null
 
-    $codexInner = New-Object System.Windows.Controls.StackPanel
-    $codexInner.Margin = "10,8,10,8"
-
-    $codexHeader = New-Object System.Windows.Controls.Grid
-    $codexHeader.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
-    $codexHeader.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
-
-    $codexLabel = New-TextBlock "CODEX" 9.5 "SemiBold" "#6FE8FF"
-    $codexLabel.Opacity = 0.85
-    $codexUpdated = New-TextBlock "not updated" 9 "Regular" "#AAB7BD"
-    $codexUpdated.Margin = "8,0,0,0"
-    $codexUpdated.Opacity = 0.62
-    [System.Windows.Controls.Grid]::SetColumn($codexUpdated, 1)
-    $codexHeader.Children.Add($codexLabel) | Out-Null
-    $codexHeader.Children.Add($codexUpdated) | Out-Null
-
-    $current = New-LimitRow "CURRENT SESSION" $false 5
-    $weekly = New-LimitRow "WEEKLY" $false 7
-
-    $codexActivity = New-TextBlock "Last activity: waiting for token details" 9 "Regular" "#E2E9EC"
-    $codexActivity.Margin = "0,6,0,0"
-    $codexActivity.Opacity = 0.74
-
-    $codexHint = New-TextBlock "Usage pace looks balanced." 9.5 "Regular" "#D6E2E8"
-    $codexHint.Margin = "0,2,0,0"
-    $codexHint.Opacity = 0.78
-
-    $codexInner.Children.Add($codexHeader) | Out-Null
-    $codexInner.Children.Add($current.panel) | Out-Null
-    $codexInner.Children.Add($weekly.panel) | Out-Null
-    $codexInner.Children.Add($codexActivity) | Out-Null
-    $codexInner.Children.Add($codexHint) | Out-Null
-
-    $codexSection.Child = $codexInner
-    [System.Windows.Controls.Grid]::SetRow($codexSection, 0)
-    $sectionsGrid.Children.Add($codexSection) | Out-Null
-
-    # Minimax section with orange border
-    $minimaxSection = New-Object System.Windows.Controls.Border
-    $minimaxSection.Margin = "0,8,0,0"
-    $minimaxSection.Padding = "0"
-    $minimaxSection.BorderThickness = 1
-    $minimaxSection.CornerRadius = 10
-    $minimaxSection.BorderBrush = Get-Brush "#FF8A3D"
-    $minimaxSection.BorderBrush.Opacity = 0.35
-    $minimaxSection.Background = [System.Windows.Media.Brushes]::Transparent
-
-    $minimaxInner = New-Object System.Windows.Controls.StackPanel
-    $minimaxInner.Margin = "10,6,10,6"
-
-    $minimaxHeader = New-Object System.Windows.Controls.Grid
-    $minimaxHeader.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
-    $minimaxHeader.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "Auto" }))
-
-    $minimaxLabel = New-TextBlock "MINIMAX" 9.5 "SemiBold" "#FF8A3D"
-    $minimaxLabel.Opacity = 0.85
-    $minimaxUpdated = New-TextBlock "not updated" 9 "Regular" "#AAB7BD"
-    $minimaxUpdated.Margin = "8,0,0,0"
-    $minimaxUpdated.Opacity = 0.62
-    [System.Windows.Controls.Grid]::SetColumn($minimaxUpdated, 1)
-    $minimaxHeader.Children.Add($minimaxLabel) | Out-Null
-    $minimaxHeader.Children.Add($minimaxUpdated) | Out-Null
-
-    $minimaxCurrent = New-LimitRow "CURRENT SESSION" $false 5
-    $minimaxWeekly = New-LimitRow "WEEKLY" $false 7
-    $minimaxInner.Children.Add($minimaxHeader) | Out-Null
-    $minimaxInner.Children.Add($minimaxCurrent.panel) | Out-Null
-    $minimaxInner.Children.Add($minimaxWeekly.panel) | Out-Null
-
-    $minimaxSection.Child = $minimaxInner
-    [System.Windows.Controls.Grid]::SetRow($minimaxSection, 1)
-    $sectionsGrid.Children.Add($minimaxSection) | Out-Null
-
-    $content.Children.Add($sectionsGrid) | Out-Null
-
-    $compactContent = New-Object System.Windows.Controls.Grid
+    $compactContent = New-Object System.Windows.Controls.Primitives.UniformGrid
     $compactContent.Visibility = "Collapsed"
-    $compactContent.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
-    $compactContent.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition -Property @{ Width = "8" }))
-    $compactContent.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
-
-    $compactCodex = New-CompactProviderPanel "CODEX" "#6FE8FF"
-    $compactMinimax = New-CompactProviderPanel "MINIMAX" "#FF8A3D"
-    [System.Windows.Controls.Grid]::SetColumn($compactCodex.panel, 0)
-    [System.Windows.Controls.Grid]::SetColumn($compactMinimax.panel, 2)
-    $compactContent.Children.Add($compactCodex.panel) | Out-Null
-    $compactContent.Children.Add($compactMinimax.panel) | Out-Null
+    $compactContent.Columns = (Get-CompactLayoutMetrics (Get-VisibleProviderCount)).Columns
+    $compactProviders = [ordered]@{}
+    foreach ($providerId in (Get-ProviderIds)) {
+        $metadata = Get-ProviderMetadata $providerId
+        $compactPanel = New-CompactProviderPanel $metadata.title $metadata.accent
+        $compactProviders[$providerId] = $compactPanel
+        $compactContent.Children.Add($compactPanel.panel) | Out-Null
+    }
 
     $root.Children.Add($content) | Out-Null
     $root.Children.Add($compactContent) | Out-Null
@@ -3073,19 +3969,20 @@ function Build-Widget {
         Outer = $outer
         FullContent = $content
         CompactContent = $compactContent
-        CodexSection = $codexSection
-        MinimaxSection = $minimaxSection
-        Current = $current
-        Weekly = $weekly
-        MinimaxCurrent = $minimaxCurrent
-        MinimaxWeekly = $minimaxWeekly
-        CompactCodex = $compactCodex
-        CompactMinimax = $compactMinimax
-        CodexActivity = $codexActivity
-        CodexHint = $codexHint
-        CodexUpdated = $codexUpdated
-        MinimaxUpdated = $minimaxUpdated
+        ProviderSections = $providerSections
+        CompactProviders = $compactProviders
         Updated = $updated
+    }
+
+    foreach ($providerId in (Get-ProviderIds)) {
+        $providerSection = Get-ObjectValue $providerSections $providerId $null
+        if ($providerSection -and $providerSection.ActionButton) {
+            $providerSection.ActionButton.Tag = $providerId
+            $providerSection.ActionButton.Add_Click({
+                param($sender)
+                Invoke-ProviderRefreshAction ([string]$sender.Tag) $controls
+            })
+        }
     }
 
     $tray = New-TrayIcon $window
@@ -3155,4 +4052,6 @@ function Build-Widget {
     $window.ShowDialog()
 }
 
-Build-Widget | Out-Null
+if ($env:USAGE_WIDGET_TEST_MODE -ne "1") {
+    Build-Widget | Out-Null
+}

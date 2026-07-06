@@ -1,0 +1,39 @@
+$env:USAGE_WIDGET_TEST_MODE = "1"
+. "$PSScriptRoot\..\usage-widget.ps1"
+
+Describe "Shared provider rendering regressions" {
+    It "keeps Codex mapped to two limit windows" {
+        $metadata = Get-ProviderMetadata "codex"
+        $usage = [pscustomobject]@{
+            ok = $true
+            primary = [pscustomobject]@{
+                used_percent = 11
+            }
+            secondary = [pscustomobject]@{
+                used_percent = 33
+            }
+        }
+
+        $windows = @(Get-ProviderUsageWindows $metadata $usage)
+
+        $windows.Count | Should Be 2
+        $windows[0].title | Should Be "CURRENT SESSION"
+        $windows[1].title | Should Be "WEEKLY"
+    }
+
+    It "keeps Grok mapped to a single weekly window" {
+        $metadata = Get-ProviderMetadata "grok"
+        $usage = [pscustomobject]@{
+            ok = $true
+            primary = [pscustomobject]@{
+                used_percent = 55
+            }
+            secondary = $null
+        }
+
+        $windows = @(Get-ProviderUsageWindows $metadata $usage)
+
+        $windows.Count | Should Be 1
+        $windows[0].title | Should Be "WEEKLY"
+    }
+}

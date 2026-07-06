@@ -34,11 +34,17 @@
                     "enabled":  false,
                     "source":  "token_plan",
                     "url":  "https://api.minimax.io/v1/token_plan/remains",
-                    "modelPattern":  "MiniMax-M*",
+                    "modelPattern":  "general",
                     "sshTarget":  "",
                     "sshRemoteCommand":  "mmx quota --output json --non-interactive",
                     "refreshSeconds":  300,
                     "timeoutSeconds":  10
+                },
+    "grok":  {
+                 "enabled":  false,
+                 "logPath":  "",
+                 "staleAfterSeconds":  900,
+                 "apiTimeoutSeconds":  12
                 },
     "window":  {
                    "left":  0,
