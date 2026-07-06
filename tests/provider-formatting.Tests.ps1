@@ -16,7 +16,7 @@ Describe "Provider formatting helpers" {
         $resetSeconds = [DateTimeOffset]::Now.AddHours(4).ToUnixTimeSeconds()
         $label = Format-ResetLabel $resetSeconds
 
-        $label.StartsWith("↻ ") | Should Be $true
+        $label.StartsWith(("{0} " -f (Get-UiGlyph "reset"))) | Should Be $true
         $label.Contains("Reset") | Should Be $false
         $label.Contains("Bali") | Should Be $false
     }

@@ -25,7 +25,8 @@ Describe "Provider hint and status helpers" {
         $status = Get-UsageStatus $limit
 
         $status.Label | Should Be "WAIT"
-        $status.ChipText.StartsWith("⏳ ") | Should Be $true
+        $status.ChipText | Should Match "WAIT$"
+        $status.CountdownText.StartsWith(("{0} " -f (Get-UiGlyph "hourglass"))) | Should Be $true
     }
 
     It "marks near-reset usage as reset soon" {
@@ -38,7 +39,7 @@ Describe "Provider hint and status helpers" {
         $status = Get-UsageStatus $limit
 
         $status.Label | Should Be "RESET SOON"
-        $status.ChipText | Should Be "↻ RESET SOON"
+        $status.ChipText | Should Be ("{0} RESET SOON" -f (Get-UiGlyph "reset"))
     }
 
     It "builds a projection hint for grok from the weekly window" {
@@ -55,7 +56,7 @@ Describe "Provider hint and status helpers" {
 
         $hint = Get-ProviderHint "grok" $usage
 
-        $hint.Text | Should Be "Pace: OK · projected 40% used at reset"
+        $hint.Text | Should Be "Pace: OK - projected 40% used at reset"
     }
 
     It "surfaces stale telemetry in the pace hint" {
