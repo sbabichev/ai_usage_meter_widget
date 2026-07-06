@@ -108,7 +108,7 @@ function New-ProviderMetadataMap {
             supportsActivity = $true
             supportsHint = $true
             supportsRefresh = $false
-            defaultWindows = @("CURRENT SESSION", "WEEKLY")
+            defaultWindows = @("Session", "Weekly")
         }
         minimax = [pscustomobject]@{
             id = "minimax"
@@ -120,7 +120,7 @@ function New-ProviderMetadataMap {
             supportsActivity = $false
             supportsHint = $false
             supportsRefresh = $false
-            defaultWindows = @("CURRENT SESSION", "WEEKLY")
+            defaultWindows = @("Session", "Weekly")
         }
         grok = [pscustomobject]@{
             id = "grok"
@@ -134,7 +134,7 @@ function New-ProviderMetadataMap {
             supportsRefresh = $true
             actionLabel = "API"
             actionToolTip = "Check via API"
-            defaultWindows = @("WEEKLY")
+            defaultWindows = @("Weekly")
         }
     }
 }
@@ -1329,48 +1329,157 @@ function Get-UsageStatus($limit, $isStale = $false, $limitReachedType = $null, $
     }
 }
 
-function Get-ProviderHint($providerId, $usage, $limitReachedType = $null) {
-    if (-not $usage -or -not $usage.ok -or -not $usage.primary) {
+function Get-WeeklyHintLimit($providerId, $usage) {
+    if (-not $usage) {
+        return $null
+    }
+
+    if ($usage.secondary) {
+        return $usage.secondary
+    }
+
+    if (-not $usage.primary) {
+        return $null
+    }
+
+    $metadata = Get-ObjectValue $script:ProviderMetadata $providerId $null
+    $defaultWindows = @()
+    if ($metadata) {
+        $defaultWindows = @(Get-ObjectValue $metadata "defaultWindows" @())
+    }
+
+    if ($defaultWindows.Count -eq 1 -and $defaultWindows[0] -eq "Weekly") {
+        return $usage.primary
+    }
+
+    $windowMinutes = Convert-ToInt64 (Get-ObjectValue $usage.primary "window_minutes" 0)
+    if ($windowMinutes -ge 8640) {
+        return $usage.primary
+    }
+
+    return $null
+}
+
+function Get-WeeklyHint($providerId, $usage, $limitReachedType = $null) {
+    if (-not $usage -or -not $usage.ok) {
         return [pscustomobject]@{
-            Text = "Pace: WAIT · waiting for fresh telemetry"
+            Text = "No weekly limit data."
             Color = "#D6E2E8"
+            ToolTip = $null
         }
     }
 
-    $primaryProjection = Get-UsageProjection $usage.primary
-    $status = Get-UsageStatus $usage.primary $usage.isStale $limitReachedType $primaryProjection
-    $hintColor = $status.Palette.Foreground
-
-    if ($providerId -eq "codex" -and $status.State -eq "ok" -and $usage.secondary) {
-        $secondaryProjection = Get-UsageProjection $usage.secondary
-        if ($secondaryProjection.Ready -and $secondaryProjection.ProjectedUsedPercent -ge 90) {
-            $status = [pscustomobject]@{
-                State = "low"
-                Label = "LOW"
-                Palette = Get-StatusPalette "low"
-            }
-            $hintColor = $status.Palette.Foreground
+    $weekly = Get-WeeklyHintLimit $providerId $usage
+    if (-not $weekly) {
+        return [pscustomobject]@{
+            Text = "No weekly limit data."
+            Color = "#D6E2E8"
+            ToolTip = $null
         }
     }
 
     if ($usage.isStale) {
         return [pscustomobject]@{
-            Text = "Pace: {0} · telemetry may be stale" -f $status.Label
+            Text = "Waiting for fresh data."
             Color = "#FFC857"
+            ToolTip = $null
         }
     }
 
-    if (-not $primaryProjection.Ready) {
+    $weeklyUsedPercent = [Math]::Max([double]0, [Math]::Min([double]100, [double]$weekly.used_percent))
+    if (-not [string]::IsNullOrWhiteSpace($limitReachedType) -or $weeklyUsedPercent -ge 100) {
         return [pscustomobject]@{
-            Text = "Pace: {0} · building baseline" -f $status.Label
-            Color = $hintColor
+            Text = "Weekly limit reached, wait for reset."
+            Color = "#FF8A3D"
+            ToolTip = $null
         }
+    }
+
+    $remainingSpan = Get-RemainingSpan $weekly.resets_at
+    if ($remainingSpan -and $remainingSpan.TotalHours -le 6) {
+        $text = if ($weeklyUsedPercent -ge 80) {
+            "Reset is soon, heavy tasks can wait."
+        } else {
+            "Reset is soon, you are fine."
+        }
+
+        return [pscustomobject]@{
+            Text = $text
+            Color = "#FFD4B5"
+            ToolTip = $null
+        }
+    }
+
+    $windowMinutes = Convert-ToInt64 (Get-ObjectValue $weekly "window_minutes" 0)
+    $timingReady = $false
+    $elapsedPercent = 0
+    $weeklyEndEstimate = $null
+    $safeDelta = $null
+    if ($remainingSpan -and $windowMinutes -gt 0) {
+        $elapsedPercent = [Math]::Max([double]0, [Math]::Min([double]100, 100 - (Get-TimeLeftPercent $weekly)))
+        if ($elapsedPercent -ge 5) {
+            $timingReady = $true
+            $weeklyEndEstimate = [Math]::Max([double]0, [Math]::Min([double]150, ($weeklyUsedPercent / $elapsedPercent) * 100))
+            $safeDelta = $weeklyUsedPercent - ($elapsedPercent * 0.90)
+        }
+    }
+
+    $text = $null
+    $color = "#D6E2E8"
+    if (-not $timingReady) {
+        if ($weeklyUsedPercent -lt 50) {
+            $text = "Plenty of room for normal use."
+        } elseif ($weeklyUsedPercent -lt 75) {
+            $text = "Still healthy, keep using normally."
+        } elseif ($weeklyUsedPercent -lt 90) {
+            $text = "Use a bit slower, this week may get tight."
+            $color = "#FFC857"
+        } else {
+            $text = "Save it for important tasks this week."
+            $color = "#FF8A3D"
+        }
+    } else {
+        if ($weeklyUsedPercent -ge 95) {
+            $text = "Save it for important tasks this week."
+            $color = "#FF8A3D"
+        } elseif ($weeklyUsedPercent -ge 85) {
+            $text = "Use a bit slower, this week may get tight."
+            $color = "#FFC857"
+        } elseif ($weeklyEndEstimate -ge 95) {
+            $text = "Use a bit slower, this week may get tight."
+            $color = "#FFC857"
+        } elseif ($safeDelta -ge 10) {
+            $text = "Use a bit slower, this week may get tight."
+            $color = "#FFC857"
+        } elseif ($weeklyUsedPercent -lt 50 -and $weeklyEndEstimate -lt 80) {
+            $text = "Plenty of room for normal use."
+        } else {
+            $text = "Still healthy, keep using normally."
+        }
+    }
+
+    $tooltipLines = @(
+        ("Weekly used: {0:N0}%" -f $weeklyUsedPercent)
+    )
+
+    if ($null -ne $weeklyEndEstimate) {
+        $tooltipLines += ("By reset: {0:N0}%" -f [Math]::Round($weeklyEndEstimate))
+    }
+
+    $resetAt = Convert-UnixSeconds $weekly.resets_at
+    if ($resetAt) {
+        $tooltipLines += ("Reset: {0}" -f $resetAt.LocalDateTime.ToString("MMM d, h:mm tt", [Globalization.CultureInfo]::InvariantCulture))
     }
 
     return [pscustomobject]@{
-        Text = "Pace: {0} · projected {1}% used at reset" -f $status.Label, $primaryProjection.ProjectedUsedPercent
-        Color = $hintColor
+        Text = $text
+        Color = $color
+        ToolTip = ($tooltipLines -join [Environment]::NewLine)
     }
+}
+
+function Get-ProviderHint($providerId, $usage, $limitReachedType = $null) {
+    return Get-WeeklyHint $providerId $usage $limitReachedType
 }
 
 function Get-TimeLeftPercent($limit) {
@@ -3141,7 +3250,7 @@ function Set-StatusChipVisual($border, $textBlock, $status, $visible = $true) {
 
 function New-LimitRow($title, $large, $timeSegments) {
     $panel = New-Object System.Windows.Controls.StackPanel
-    $panel.Margin = if ($large) { "0,10,0,0" } else { "0,4,0,0" }
+    $panel.Margin = if ($large) { "0,10,0,0" } else { "0,6,0,0" }
 
     $header = New-Object System.Windows.Controls.Grid
     $header.ColumnDefinitions.Add((New-Object System.Windows.Controls.ColumnDefinition))
@@ -3480,7 +3589,13 @@ function New-ProviderSection($metadata) {
 
     $rows = @()
     foreach ($windowTitle in $metadata.defaultWindows) {
-        $row = New-LimitRow $windowTitle ($rows.Count -eq 0) 7
+        $isPrimaryWindow = ($rows.Count -eq 0)
+        $timeSegments = switch -Exact ($windowTitle) {
+            "Session" { 5 }
+            "Weekly" { 7 }
+            default { if ($isPrimaryWindow) { 5 } else { 7 } }
+        }
+        $row = New-LimitRow $windowTitle $isPrimaryWindow $timeSegments
         $rows += $row
         $inner.Children.Add($row.panel) | Out-Null
     }
@@ -3497,7 +3612,7 @@ function New-ProviderSection($metadata) {
 
     $hintBlock = $null
     if ($metadata.supportsHint) {
-        $hintBlock = New-TextBlock "Usage pace looks balanced." 9.5 "Regular" "#D6E2E8"
+        $hintBlock = New-TextBlock "No weekly limit data." 9.5 "Regular" "#D6E2E8"
         $hintBlock.Margin = "0,4,0,0"
         $hintBlock.Opacity = 0.86
         $inner.Children.Add($hintBlock) | Out-Null
@@ -3530,7 +3645,7 @@ function Get-ProviderUsageWindows($metadata, $usage) {
 
     if ($usage -and $usage.secondary) {
         $windows += [pscustomobject]@{
-            title = if ($defaultTitles.Count -ge 2) { $defaultTitles[1] } else { "WEEKLY" }
+            title = if ($defaultTitles.Count -ge 2) { $defaultTitles[1] } else { "Weekly" }
             limit = $usage.secondary
         }
     }
@@ -3610,6 +3725,7 @@ function Update-ProviderSection($control, $usage, $activity) {
             $hint = Get-ProviderHint $metadata.id $null
             $control.Hint.Text = $hint.Text
             $control.Hint.Foreground = Get-Brush $hint.Color
+            $control.Hint.ToolTip = $hint.ToolTip
         }
 
         if ($control.Activity) {
@@ -3639,6 +3755,7 @@ function Update-ProviderSection($control, $usage, $activity) {
         $hint = Get-ProviderHint $metadata.id $usage (Get-ObjectValue $usage "limitReachedType" $null)
         $control.Hint.Text = $hint.Text
         $control.Hint.Foreground = Get-Brush $hint.Color
+        $control.Hint.ToolTip = $hint.ToolTip
     }
 
     if ($control.Activity) {
@@ -3765,48 +3882,157 @@ function Get-UsageStatus($limit, $isStale = $false, $limitReachedType = $null, $
     }
 }
 
-function Get-ProviderHint($providerId, $usage, $limitReachedType = $null) {
-    if (-not $usage -or -not $usage.ok -or -not $usage.primary) {
+function Get-WeeklyHintLimit($providerId, $usage) {
+    if (-not $usage) {
+        return $null
+    }
+
+    if ($usage.secondary) {
+        return $usage.secondary
+    }
+
+    if (-not $usage.primary) {
+        return $null
+    }
+
+    $metadata = Get-ObjectValue $script:ProviderMetadata $providerId $null
+    $defaultWindows = @()
+    if ($metadata) {
+        $defaultWindows = @(Get-ObjectValue $metadata "defaultWindows" @())
+    }
+
+    if ($defaultWindows.Count -eq 1 -and $defaultWindows[0] -eq "Weekly") {
+        return $usage.primary
+    }
+
+    $windowMinutes = Convert-ToInt64 (Get-ObjectValue $usage.primary "window_minutes" 0)
+    if ($windowMinutes -ge 8640) {
+        return $usage.primary
+    }
+
+    return $null
+}
+
+function Get-WeeklyHint($providerId, $usage, $limitReachedType = $null) {
+    if (-not $usage -or -not $usage.ok) {
         return [pscustomobject]@{
-            Text = "Pace: WAIT - waiting for fresh telemetry"
+            Text = "No weekly limit data."
             Color = "#D6E2E8"
+            ToolTip = $null
         }
     }
 
-    $primaryProjection = Get-UsageProjection $usage.primary
-    $status = Get-UsageStatus $usage.primary $usage.isStale $limitReachedType $primaryProjection
-    $hintColor = $status.Palette.Foreground
-
-    if ($providerId -eq "codex" -and $status.State -eq "ok" -and $usage.secondary) {
-        $secondaryProjection = Get-UsageProjection $usage.secondary
-        if ($secondaryProjection.Ready -and $secondaryProjection.ProjectedUsedPercent -ge 90) {
-            $status = [pscustomobject]@{
-                State = "low"
-                Label = "LOW"
-                Palette = Get-StatusPalette "low"
-            }
-            $hintColor = $status.Palette.Foreground
+    $weekly = Get-WeeklyHintLimit $providerId $usage
+    if (-not $weekly) {
+        return [pscustomobject]@{
+            Text = "No weekly limit data."
+            Color = "#D6E2E8"
+            ToolTip = $null
         }
     }
 
     if ($usage.isStale) {
         return [pscustomobject]@{
-            Text = "Pace: {0} - telemetry may be stale" -f $status.Label
+            Text = "Waiting for fresh data."
             Color = "#FFC857"
+            ToolTip = $null
         }
     }
 
-    if (-not $primaryProjection.Ready) {
+    $weeklyUsedPercent = [Math]::Max([double]0, [Math]::Min([double]100, [double]$weekly.used_percent))
+    if (-not [string]::IsNullOrWhiteSpace($limitReachedType) -or $weeklyUsedPercent -ge 100) {
         return [pscustomobject]@{
-            Text = "Pace: {0} - building baseline" -f $status.Label
-            Color = $hintColor
+            Text = "Weekly limit reached, wait for reset."
+            Color = "#FF8A3D"
+            ToolTip = $null
         }
+    }
+
+    $remainingSpan = Get-RemainingSpan $weekly.resets_at
+    if ($remainingSpan -and $remainingSpan.TotalHours -le 6) {
+        $text = if ($weeklyUsedPercent -ge 80) {
+            "Reset is soon, heavy tasks can wait."
+        } else {
+            "Reset is soon, you are fine."
+        }
+
+        return [pscustomobject]@{
+            Text = $text
+            Color = "#FFD4B5"
+            ToolTip = $null
+        }
+    }
+
+    $windowMinutes = Convert-ToInt64 (Get-ObjectValue $weekly "window_minutes" 0)
+    $timingReady = $false
+    $elapsedPercent = 0
+    $weeklyEndEstimate = $null
+    $safeDelta = $null
+    if ($remainingSpan -and $windowMinutes -gt 0) {
+        $elapsedPercent = [Math]::Max([double]0, [Math]::Min([double]100, 100 - (Get-TimeLeftPercent $weekly)))
+        if ($elapsedPercent -ge 5) {
+            $timingReady = $true
+            $weeklyEndEstimate = [Math]::Max([double]0, [Math]::Min([double]150, ($weeklyUsedPercent / $elapsedPercent) * 100))
+            $safeDelta = $weeklyUsedPercent - ($elapsedPercent * 0.90)
+        }
+    }
+
+    $text = $null
+    $color = "#D6E2E8"
+    if (-not $timingReady) {
+        if ($weeklyUsedPercent -lt 50) {
+            $text = "Plenty of room for normal use."
+        } elseif ($weeklyUsedPercent -lt 75) {
+            $text = "Still healthy, keep using normally."
+        } elseif ($weeklyUsedPercent -lt 90) {
+            $text = "Use a bit slower, this week may get tight."
+            $color = "#FFC857"
+        } else {
+            $text = "Save it for important tasks this week."
+            $color = "#FF8A3D"
+        }
+    } else {
+        if ($weeklyUsedPercent -ge 95) {
+            $text = "Save it for important tasks this week."
+            $color = "#FF8A3D"
+        } elseif ($weeklyUsedPercent -ge 85) {
+            $text = "Use a bit slower, this week may get tight."
+            $color = "#FFC857"
+        } elseif ($weeklyEndEstimate -ge 95) {
+            $text = "Use a bit slower, this week may get tight."
+            $color = "#FFC857"
+        } elseif ($safeDelta -ge 10) {
+            $text = "Use a bit slower, this week may get tight."
+            $color = "#FFC857"
+        } elseif ($weeklyUsedPercent -lt 50 -and $weeklyEndEstimate -lt 80) {
+            $text = "Plenty of room for normal use."
+        } else {
+            $text = "Still healthy, keep using normally."
+        }
+    }
+
+    $tooltipLines = @(
+        ("Weekly used: {0:N0}%" -f $weeklyUsedPercent)
+    )
+
+    if ($null -ne $weeklyEndEstimate) {
+        $tooltipLines += ("By reset: {0:N0}%" -f [Math]::Round($weeklyEndEstimate))
+    }
+
+    $resetAt = Convert-UnixSeconds $weekly.resets_at
+    if ($resetAt) {
+        $tooltipLines += ("Reset: {0}" -f $resetAt.LocalDateTime.ToString("MMM d, h:mm tt", [Globalization.CultureInfo]::InvariantCulture))
     }
 
     return [pscustomobject]@{
-        Text = "Pace: {0} - projected {1}% used at reset" -f $status.Label, $primaryProjection.ProjectedUsedPercent
-        Color = $hintColor
+        Text = $text
+        Color = $color
+        ToolTip = ($tooltipLines -join [Environment]::NewLine)
     }
+}
+
+function Get-ProviderHint($providerId, $usage, $limitReachedType = $null) {
+    return Get-WeeklyHint $providerId $usage $limitReachedType
 }
 
 function New-LimitRow($title, $large, $timeSegments) {
@@ -4115,6 +4341,7 @@ function Update-ProviderSection($control, $usage, $activity) {
             $hint = Get-ProviderHint $metadata.id $null
             $control.Hint.Text = $hint.Text
             $control.Hint.Foreground = Get-Brush $hint.Color
+            $control.Hint.ToolTip = $hint.ToolTip
         }
 
         if ($control.Activity) {
@@ -4142,6 +4369,7 @@ function Update-ProviderSection($control, $usage, $activity) {
         $hint = Get-ProviderHint $metadata.id $usage (Get-ObjectValue $usage "limitReachedType" $null)
         $control.Hint.Text = $hint.Text
         $control.Hint.Foreground = Get-Brush $hint.Color
+        $control.Hint.ToolTip = $hint.ToolTip
     }
 
     if ($control.Activity) {
