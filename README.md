@@ -17,9 +17,13 @@ This is a small WPF desktop app styled like a widget. It is not a native Windows
 
 ## Screenshot
 
-The UI is a frameless, fixed-size, Apple-like glass panel with a minimal `Codex PLUS` wordmark.
-<img width="261" height="250" alt="image" src="https://github.com/user-attachments/assets/e1c0429c-94c2-477f-8245-3ca92a508648" />
+Detailed widget in "always on top" mode 
+<br>
+<img width="360" alt="image" src="https://github.com/user-attachments/assets/86de1bd3-03c8-42fa-a5a7-6e257c0abba3" />
 
+Compact mode fits in taskbar
+<br>
+<img width="514" alt="image" src="https://github.com/user-attachments/assets/be94b07d-d3dd-46e0-88a5-98dd96c1766e" />
 
 ## Requirements
 
