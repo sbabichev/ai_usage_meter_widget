@@ -31,4 +31,25 @@ Describe "Usage display mode helpers" {
         $display.percent | Should Be 18
         $display.accentPercent | Should Be 82
     }
+
+    It "allows hover detail only in compact mode for visible providers" {
+        $script:ProviderEnabledMap = [ordered]@{
+            codex = $true
+            minimax = $false
+            grok = $true
+        }
+        $script:ProviderVisibility = [ordered]@{
+            codex = $true
+            minimax = $false
+            grok = $true
+        }
+
+        $script:CompactMode = $false
+        Test-CanShowHoverDetail "codex" | Should Be $false
+
+        $script:CompactMode = $true
+        Test-CanShowHoverDetail "codex" | Should Be $true
+        Test-CanShowHoverDetail "minimax" | Should Be $false
+        Test-CanShowHoverDetail "" | Should Be $false
+    }
 }

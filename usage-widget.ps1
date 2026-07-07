@@ -85,6 +85,9 @@ $script:CompactTopmostTimer = $null
 $script:CodexSessionChangeTimer = $null
 $script:CodexLastSessionChangeKey = ""
 $script:FullWidgetHeight = $script:WidgetHeight
+$script:HoverDetailOpenDelayMs = 320
+$script:HoverDetailCloseDelayMs = 140
+$script:HoverDetailState = $null
 $script:UsageFloorState = @{
     WindowKey = ""
     PrimaryUsed = $null
@@ -150,6 +153,218 @@ function Get-ProviderIds {
 
 function Get-ProviderMetadata($providerId) {
     return Get-ObjectValue $script:ProviderMetadata $providerId $null
+}
+
+function New-HoverDetailState($controls = $null) {
+    return [pscustomobject]@{
+        Controls = $controls
+        Window = $null
+        Outer = $null
+        ContentHost = $null
+        PopupControl = $null
+        ProviderId = $null
+        PendingProviderId = $null
+        HoverProviderId = $null
+        SourcePanel = $null
+        IsPointerOverPopup = $false
+        OpenTimer = $null
+        CloseTimer = $null
+        UsageMap = [ordered]@{}
+        Activity = $null
+    }
+}
+
+function Get-HoverDetailState($controls = $null) {
+    if (-not $script:HoverDetailState) {
+        $script:HoverDetailState = New-HoverDetailState $controls
+    } elseif ($controls) {
+        $script:HoverDetailState.Controls = $controls
+    }
+
+    return $script:HoverDetailState
+}
+
+function Stop-DispatcherTimer($timer) {
+    if ($null -eq $timer) {
+        return
+    }
+
+    try {
+        $timer.Stop()
+    } catch {
+    }
+}
+
+function Stop-HoverDetailOpenTimer {
+    $state = Get-HoverDetailState
+    Stop-DispatcherTimer $state.OpenTimer
+}
+
+function Stop-HoverDetailCloseTimer {
+    $state = Get-HoverDetailState
+    Stop-DispatcherTimer $state.CloseTimer
+}
+
+function Clear-HoverDetailPendingProvider {
+    $state = Get-HoverDetailState
+    $state.PendingProviderId = $null
+    $state.SourcePanel = $null
+    Stop-HoverDetailOpenTimer
+}
+
+function Test-CanShowHoverDetail($providerId) {
+    if (-not $script:CompactMode) {
+        return $false
+    }
+
+    if ([string]::IsNullOrWhiteSpace($providerId)) {
+        return $false
+    }
+
+    return (Get-VisibleProviderIds) -contains $providerId
+}
+
+function New-WidgetOuterBorder {
+    $outer = New-Object System.Windows.Controls.Border
+    $outer.Margin = "6"
+    $outer.Padding = "12,10,12,4"
+    $outer.CornerRadius = 16
+    $outer.BorderThickness = 1
+    $outer.BorderBrush = Get-Brush "#AAB7BD"
+    $outer.Background = Get-Brush "#E00E1821"
+    $outer.Effect = New-Object System.Windows.Media.Effects.DropShadowEffect -Property @{
+        BlurRadius = 8
+        ShadowDepth = 0
+        Opacity = 0.18
+        Color = [System.Windows.Media.ColorConverter]::ConvertFromString("#02080E")
+    }
+
+    return $outer
+}
+
+function Get-VisualScreenRect($element) {
+    if (-not $element) {
+        return $null
+    }
+
+    try {
+        $point = $element.PointToScreen([System.Windows.Point]::new(0, 0))
+        $width = if ($element.ActualWidth -gt 0) { [double]$element.ActualWidth } else { 0 }
+        $height = if ($element.ActualHeight -gt 0) { [double]$element.ActualHeight } else { 0 }
+        return [pscustomobject]@{
+            Left = [double]$point.X
+            Top = [double]$point.Y
+            Width = $width
+            Height = $height
+            Right = [double]$point.X + $width
+            Bottom = [double]$point.Y + $height
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Get-ScreenWorkAreaForRect($rect) {
+    $defaultBounds = [System.Windows.SystemParameters]::WorkArea
+    if (-not $rect) {
+        return [pscustomobject]@{
+            Left = [double]$defaultBounds.Left
+            Top = [double]$defaultBounds.Top
+            Width = [double]$defaultBounds.Width
+            Height = [double]$defaultBounds.Height
+            Right = [double]$defaultBounds.Right
+            Bottom = [double]$defaultBounds.Bottom
+        }
+    }
+
+    $centerX = [int][Math]::Round($rect.Left + ($rect.Width / 2))
+    $centerY = [int][Math]::Round($rect.Top + ($rect.Height / 2))
+    $screen = [System.Windows.Forms.Screen]::FromPoint([System.Drawing.Point]::new($centerX, $centerY))
+    $bounds = $screen.WorkingArea
+
+    return [pscustomobject]@{
+        Left = [double]$bounds.Left
+        Top = [double]$bounds.Top
+        Width = [double]$bounds.Width
+        Height = [double]$bounds.Height
+        Right = [double]$bounds.Right
+        Bottom = [double]$bounds.Bottom
+    }
+}
+
+function Get-HoverDetailPlacement($ownerRect, $sourceRect, $popupSize, $workArea, $gap = 8) {
+    $anchorRect = if ($sourceRect) { $sourceRect } else { $ownerRect }
+
+    $left = $anchorRect.Left
+    if ($ownerRect) {
+        $left = [Math]::Max($ownerRect.Left, $left)
+    }
+
+    $maxLeft = [Math]::Max($workArea.Left, $workArea.Right - $popupSize.Width)
+    if ($left -gt $maxLeft) {
+        $left = $maxLeft
+    }
+
+    if ($left -lt $workArea.Left) {
+        $left = $workArea.Left
+    }
+
+    $preferredTop = $anchorRect.Top - $popupSize.Height - $gap
+    $fallbackTop = $anchorRect.Bottom + $gap
+    $top = if ($preferredTop -ge $workArea.Top) { $preferredTop } else { $fallbackTop }
+    $maxTop = [Math]::Max($workArea.Top, $workArea.Bottom - $popupSize.Height)
+    if ($top -gt $maxTop) {
+        $top = $maxTop
+    }
+
+    if ($top -lt $workArea.Top) {
+        $top = $workArea.Top
+    }
+
+    return [pscustomobject]@{
+        Left = [Math]::Round($left)
+        Top = [Math]::Round($top)
+    }
+}
+
+function Get-OwnerWindowRect($window) {
+    if (-not $window) {
+        return $null
+    }
+
+    $width = if ($window.ActualWidth -gt 0) { [double]$window.ActualWidth } elseif ($window.Width -gt 0) { [double]$window.Width } else { [double]$script:WidgetWidth }
+    $height = if ($window.ActualHeight -gt 0) { [double]$window.ActualHeight } elseif ($window.Height -gt 0) { [double]$window.Height } else { [double]$script:WidgetHeight }
+
+    return [pscustomobject]@{
+        Left = [double]$window.Left
+        Top = [double]$window.Top
+        Width = $width
+        Height = $height
+        Right = [double]$window.Left + $width
+        Bottom = [double]$window.Top + $height
+    }
+}
+
+function Get-ElementRectWithinOwner($element, $ownerWindow) {
+    if (-not $element -or -not $ownerWindow) {
+        return $null
+    }
+
+    try {
+        $point = $element.TranslatePoint([System.Windows.Point]::new(0, 0), $ownerWindow)
+        $width = if ($element.ActualWidth -gt 0) { [double]$element.ActualWidth } else { 0 }
+        $height = if ($element.ActualHeight -gt 0) { [double]$element.ActualHeight } else { 0 }
+        return [pscustomobject]@{
+            Left = [double]$ownerWindow.Left + [double]$point.X
+            Top = [double]$ownerWindow.Top + [double]$point.Y
+            Width = $width
+            Height = $height
+            Right = [double]$ownerWindow.Left + [double]$point.X + $width
+            Bottom = [double]$ownerWindow.Top + [double]$point.Y + $height
+        }
+    } catch {
+        return $null
+    }
 }
 
 function Test-IsConfigObject($value) {
@@ -663,6 +878,11 @@ function Set-WindowTopmost($window) {
         }
     } catch {
     }
+
+    $hoverState = $script:HoverDetailState
+    if ($hoverState -and $hoverState.Window -and $hoverState.Window -ne $window) {
+        $hoverState.Window.Topmost = $script:TopmostEnabled
+    }
 }
 
 function Sync-CompactTopmostTimer($window) {
@@ -838,6 +1058,7 @@ function Sync-ProviderVisibility($controls) {
 
     $controls.CompactContent.Columns = $compactColumns
     Set-WidgetMode $controls.Window $controls $script:CompactMode $false
+    Sync-HoverDetailVisibility $controls
 }
 
 function Sync-ProviderState {
@@ -3510,6 +3731,7 @@ function New-CompactProviderPanel($name, $accentColor) {
     $grid.Children.Add($bar) | Out-Null
 
     $panelBorder.Child = $grid
+    [System.Windows.Controls.ToolTipService]::SetIsEnabled($panelBorder, $false)
 
     $panel = [pscustomobject]@{
         panel = $panelBorder
@@ -4297,7 +4519,7 @@ function Update-CompactProviderPanel($panel, $metadata, $usage, $activity) {
         $panel.percentText.Text = "--"
         $panel.timeText.Text = "waiting"
         $panel.weeklyText.Text = ""
-        $panel.panel.ToolTip = "{0}: waiting for telemetry" -f $metadata.label
+        $panel.panel.ToolTip = $null
         Set-StatusChipVisual $panel.statusBorder $panel.statusText $null $false
         Set-CompactAccent $panel 0 $false
         Set-CompactWeeklyAccent $panel 0 $false
@@ -4313,7 +4535,7 @@ function Update-CompactProviderPanel($panel, $metadata, $usage, $activity) {
     $panel.percentText.Text = Format-DisplayPercent $percent
     $panel.timeText.Text = if ($status.CountdownText) { $status.CountdownText } else { Format-CompactRemaining $usage.primary.resets_at }
     $panel.weeklyText.Text = if ($null -ne $weeklyPercent) { "W $weeklyPercent%" } else { "" }
-    $panel.panel.ToolTip = Format-CompactTooltip $metadata $usage $activity
+    $panel.panel.ToolTip = $null
     Set-StatusChipVisual $panel.statusBorder $panel.statusText $status $true
     Set-CompactAccent $panel $primaryDisplay.accentPercent $true
     $weeklyAccentPercent = if ($weeklyDisplay) { $weeklyDisplay.accentPercent } else { $null }
@@ -4541,6 +4763,12 @@ function Set-WidgetMode($window, $controls, $compact, $saveState = $true, $prese
         $window.MaxHeight = $height
     }
 
+    if (-not $script:CompactMode) {
+        Hide-HoverDetailWindow
+    } else {
+        Sync-HoverDetailVisibility $controls
+    }
+
     if ($preserveBottom) {
         Move-WindowKeepingBottom $window $oldBottom
     }
@@ -4555,6 +4783,297 @@ function Set-WidgetMode($window, $controls, $compact, $saveState = $true, $prese
 function Toggle-WidgetMode($window, $controls) {
     $wasCompact = $script:CompactMode
     Set-WidgetMode $window $controls (-not $script:CompactMode) $true $wasCompact
+}
+
+function Get-HoverDetailMeasuredHeight($outer) {
+    if (-not $outer) {
+        return $script:WidgetHeight
+    }
+
+    $availableWidth = [Math]::Max(1, $script:WidgetWidth - 12)
+    $outer.Measure([System.Windows.Size]::new($availableWidth, [double]::PositiveInfinity))
+    $height = $outer.DesiredSize.Height
+    if ($height -le 0) {
+        try {
+            $outer.UpdateLayout()
+            $height = $outer.ActualHeight
+        } catch {
+            $height = 0
+        }
+    }
+
+    if ($height -le 0) {
+        return $script:WidgetHeight
+    }
+
+    return [Math]::Max(120, [Math]::Min(600, [Math]::Ceiling($height + 12)))
+}
+
+function Update-HoverDetailContent {
+    $state = Get-HoverDetailState
+    if (-not $state.PopupControl -or [string]::IsNullOrWhiteSpace($state.ProviderId)) {
+        return
+    }
+
+    $usage = Get-ObjectValue $state.UsageMap $state.ProviderId $null
+    Update-ProviderSection $state.PopupControl $usage $state.Activity
+}
+
+function Set-HoverDetailWindowPosition($window, $sourcePanel = $null) {
+    if (-not $window) {
+        return
+    }
+
+    $hoverState = Get-HoverDetailState
+    $ownerWindow = if ($hoverState.Controls) { $hoverState.Controls.Window } else { $window.Owner }
+    $ownerRect = if ($ownerWindow) { Get-OwnerWindowRect $ownerWindow } else { $null }
+    $sourceRect = if ($sourcePanel -and $ownerWindow) { Get-ElementRectWithinOwner $sourcePanel $ownerWindow } else { $null }
+    $workAreaBounds = [System.Windows.SystemParameters]::WorkArea
+    $workArea = [pscustomobject]@{
+        Left = [double]$workAreaBounds.Left
+        Top = [double]$workAreaBounds.Top
+        Width = [double]$workAreaBounds.Width
+        Height = [double]$workAreaBounds.Height
+        Right = [double]$workAreaBounds.Right
+        Bottom = [double]$workAreaBounds.Bottom
+    }
+
+    if (-not $ownerRect -and -not $sourceRect) {
+        return
+    }
+
+    $popupSize = [pscustomobject]@{
+        Width = [double]$(if ($window.Width -gt 0) { $window.Width } else { $script:WidgetWidth })
+        Height = [double]$(if ($window.Height -gt 0) { $window.Height } else { $script:WidgetHeight })
+    }
+    $placement = Get-HoverDetailPlacement $ownerRect $sourceRect $popupSize $workArea
+    $window.Left = $placement.Left
+    $window.Top = $placement.Top
+}
+
+function Start-HoverDetailCloseTimer {
+    $state = Get-HoverDetailState
+    if ($state.IsPointerOverPopup -or $state.HoverProviderId) {
+        return
+    }
+
+    Stop-HoverDetailCloseTimer
+    if (-not $state.CloseTimer) {
+        $state.CloseTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $state.CloseTimer.Interval = [TimeSpan]::FromMilliseconds($script:HoverDetailCloseDelayMs)
+        $state.CloseTimer.Add_Tick({
+            param($sender)
+            $sender.Stop()
+            $hoverState = Get-HoverDetailState
+            if ($hoverState.IsPointerOverPopup -or $hoverState.HoverProviderId) {
+                return
+            }
+
+            Hide-HoverDetailWindow
+        })
+    }
+
+    $state.CloseTimer.Start()
+}
+
+function Hide-HoverDetailWindow {
+    $state = Get-HoverDetailState
+    Stop-HoverDetailCloseTimer
+    Clear-HoverDetailPendingProvider
+    $state.IsPointerOverPopup = $false
+    $state.HoverProviderId = $null
+    if ($state.Window) {
+        try {
+            $state.Window.Hide()
+        } catch {
+        }
+    }
+    $state.ProviderId = $null
+    $state.SourcePanel = $null
+}
+
+function Mount-HoverDetailProvider($providerId, $controls) {
+    $state = Get-HoverDetailState $controls
+    $metadata = Get-ProviderMetadata $providerId
+    if (-not $state.ContentHost -or -not $metadata) {
+        return
+    }
+
+    $state.ContentHost.Children.Clear()
+    $providerSection = New-ProviderSection $metadata
+    $providerSection.Section.Margin = "0,0,0,0"
+    if ($providerSection.ActionButton) {
+        $providerSection.ActionButton.Tag = $providerId
+        $providerSection.ActionButton.Add_Click({
+            param($sender)
+            Invoke-ProviderRefreshAction ([string]$sender.Tag) $controls
+        })
+    }
+
+    $state.ContentHost.Children.Add($providerSection.Section) | Out-Null
+    $state.PopupControl = $providerSection
+    $state.ProviderId = $providerId
+}
+
+function Initialize-HoverDetailWindow($controls) {
+    $state = Get-HoverDetailState $controls
+    if ($state.Window) {
+        return $state.Window
+    }
+
+    $window = New-Object System.Windows.Window
+    $window.Title = "AI Usage Meter Hover Detail"
+    $window.Width = $script:WidgetWidth
+    $window.MinWidth = $script:WidgetWidth
+    $window.MaxWidth = $script:WidgetWidth
+    $window.SizeToContent = "Manual"
+    $window.WindowStartupLocation = "Manual"
+    $window.WindowStyle = "None"
+    $window.AllowsTransparency = $true
+    $window.Background = [System.Windows.Media.Brushes]::Transparent
+    $window.UseLayoutRounding = $true
+    $window.SnapsToDevicePixels = $true
+    $window.ResizeMode = "NoResize"
+    $window.ShowInTaskbar = $false
+    $window.ShowActivated = $false
+    $window.Topmost = ($script:CompactMode -or $script:TopmostEnabled)
+
+    $outer = New-WidgetOuterBorder
+    $contentHost = New-Object System.Windows.Controls.StackPanel
+    $contentHost.Margin = "0,0,0,0"
+    $outer.Child = $contentHost
+    $window.Content = $outer
+
+    $window.Add_MouseEnter({
+        $hoverState = Get-HoverDetailState
+        $hoverState.IsPointerOverPopup = $true
+        Stop-HoverDetailCloseTimer
+    })
+    $window.Add_MouseLeave({
+        $hoverState = Get-HoverDetailState
+        $hoverState.IsPointerOverPopup = $false
+        Start-HoverDetailCloseTimer
+    })
+
+    $state.Window = $window
+    $state.Outer = $outer
+    $state.ContentHost = $contentHost
+    return $window
+}
+
+function Show-HoverDetailWindow($controls, $providerId, $sourcePanel = $null) {
+    if (-not (Test-CanShowHoverDetail $providerId)) {
+        return
+    }
+
+    $state = Get-HoverDetailState $controls
+    Stop-HoverDetailCloseTimer
+    Clear-HoverDetailPendingProvider
+    $window = Initialize-HoverDetailWindow $controls
+    $state.SourcePanel = $sourcePanel
+    $state.IsPointerOverPopup = $false
+
+    if ($state.ProviderId -ne $providerId -or -not $state.PopupControl) {
+        Mount-HoverDetailProvider $providerId $controls
+    }
+
+    Update-HoverDetailContent
+    $window.Height = Get-HoverDetailMeasuredHeight $state.Outer
+    Set-HoverDetailWindowPosition $window $sourcePanel
+
+    if (-not $window.IsVisible) {
+        $window.Show()
+    }
+
+    Set-WindowTopmost $window
+}
+
+function Request-HoverDetailWindow($controls, $providerId, $sourcePanel) {
+    $state = Get-HoverDetailState $controls
+    Stop-HoverDetailCloseTimer
+    $state.HoverProviderId = $providerId
+    $state.PendingProviderId = $providerId
+    $state.SourcePanel = $sourcePanel
+
+    if ($state.Window -and $state.Window.IsVisible -and $state.ProviderId -eq $providerId) {
+        Set-HoverDetailWindowPosition $state.Window $sourcePanel
+        Clear-HoverDetailPendingProvider
+        return
+    }
+
+    if ($state.Window -and $state.Window.IsVisible -and $state.ProviderId -and $state.ProviderId -ne $providerId) {
+        Show-HoverDetailWindow $controls $providerId $sourcePanel
+        return
+    }
+
+    Stop-HoverDetailOpenTimer
+    if (-not $state.OpenTimer) {
+        $state.OpenTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $state.OpenTimer.Interval = [TimeSpan]::FromMilliseconds($script:HoverDetailOpenDelayMs)
+        $state.OpenTimer.Add_Tick({
+            param($sender)
+            $sender.Stop()
+            $hoverState = Get-HoverDetailState
+            if (-not $hoverState.Controls) {
+                return
+            }
+
+            $targetProviderId = [string]$hoverState.PendingProviderId
+            $targetPanel = $hoverState.SourcePanel
+            if (-not (Test-CanShowHoverDetail $targetProviderId)) {
+                Clear-HoverDetailPendingProvider
+                return
+            }
+
+            Show-HoverDetailWindow $hoverState.Controls $targetProviderId $targetPanel
+        })
+    }
+
+    $state.OpenTimer.Start()
+}
+
+function Clear-HoverProvider($providerId = $null) {
+    $state = Get-HoverDetailState
+    if (-not $providerId -or $state.HoverProviderId -eq $providerId) {
+        $state.HoverProviderId = $null
+    }
+}
+
+function Handle-CompactProviderMouseEnter($controls, $providerId, $sourcePanel) {
+    if (-not (Test-CanShowHoverDetail $providerId)) {
+        return
+    }
+
+    $state = Get-HoverDetailState $controls
+    $state.HoverProviderId = $providerId
+    Stop-HoverDetailCloseTimer
+    Request-HoverDetailWindow $controls $providerId $sourcePanel
+}
+
+function Handle-CompactProviderMouseLeave($providerId) {
+    Clear-HoverProvider $providerId
+    Start-HoverDetailCloseTimer
+}
+
+function Update-HoverDetailSnapshot($controls, $providerUsageMap, $activity) {
+    $state = Get-HoverDetailState $controls
+    $state.UsageMap = $providerUsageMap
+    $state.Activity = $activity
+    if ($state.Window -and $state.Window.IsVisible -and $state.ProviderId) {
+        Update-HoverDetailContent
+        $state.Window.Height = Get-HoverDetailMeasuredHeight $state.Outer
+        Set-HoverDetailWindowPosition $state.Window $state.SourcePanel
+    }
+}
+
+function Sync-HoverDetailVisibility($controls = $null) {
+    $state = Get-HoverDetailState $controls
+    $activeProviderId = [string]$state.ProviderId
+    $pendingProviderId = [string]$state.PendingProviderId
+    if (($activeProviderId -and -not (Test-CanShowHoverDetail $activeProviderId)) -or
+        ($pendingProviderId -and -not (Test-CanShowHoverDetail $pendingProviderId))) {
+        Hide-HoverDetailWindow
+    }
 }
 
 function Get-ProviderActionSummary($providerId) {
@@ -4650,6 +5169,8 @@ function Apply-WidgetData($controls, $usage, $minimax, $activity, $grok = $null)
             Update-CompactProviderPanel $compactControl $metadata $providerUsage $providerActivity
         }
     }
+
+    Update-HoverDetailSnapshot $controls $providerUsageMap $activity
 
     $statusUsage = @($usage, $minimax, $grok) | Where-Object { $_ -and $_.ok } | Select-Object -First 1
     $controls.Updated.Text = if ($statusUsage) { "Updated " + (Format-ProviderUpdatedText $statusUsage) } else { "Updated " + (Get-Date).ToString("HH:mm:ss") }
@@ -4938,6 +5459,7 @@ function Build-Widget {
         CompactProviders = $compactProviders
         Updated = $updated
     }
+    $null = Get-HoverDetailState $controls
 
     foreach ($providerId in (Get-ProviderIds)) {
         $providerSection = Get-ObjectValue $providerSections $providerId $null
@@ -4946,6 +5468,19 @@ function Build-Widget {
             $providerSection.ActionButton.Add_Click({
                 param($sender)
                 Invoke-ProviderRefreshAction ([string]$sender.Tag) $controls
+            })
+        }
+
+        $compactControl = Get-ObjectValue $compactProviders $providerId $null
+        if ($compactControl) {
+            $compactControl.panel.Tag = $providerId
+            $compactControl.panel.Add_MouseEnter({
+                param($sender)
+                Handle-CompactProviderMouseEnter $controls ([string]$sender.Tag) $sender
+            })
+            $compactControl.panel.Add_MouseLeave({
+                param($sender)
+                Handle-CompactProviderMouseLeave ([string]$sender.Tag)
             })
         }
     }
@@ -4968,6 +5503,7 @@ function Build-Widget {
 
     $dragHandler = {
         param($sender, $event)
+        Hide-HoverDetailWindow
         if ($event.ClickCount -ge 2) {
             Toggle-WidgetMode $window $controls
             $event.Handled = $true
@@ -4981,12 +5517,17 @@ function Build-Widget {
     $outer.Add_MouseLeftButtonDown($dragHandler)
 
     $window.Add_LocationChanged({
+        $hoverState = Get-HoverDetailState
+        if ($hoverState.Window -and $hoverState.Window.IsVisible) {
+            Set-HoverDetailWindowPosition $hoverState.Window $hoverState.SourcePanel
+        }
         if ($script:CompactMode) {
             Sync-CompactTopmostTimer $window
         }
         Save-State $window
     })
     $window.Add_Deactivated({
+        Start-HoverDetailCloseTimer
         if ($script:CompactMode) {
             Sync-CompactTopmostTimer $window
         }
@@ -4997,6 +5538,17 @@ function Build-Widget {
         }
     })
     $window.Add_Closed({
+        Hide-HoverDetailWindow
+        $hoverState = Get-HoverDetailState
+        Stop-DispatcherTimer $hoverState.OpenTimer
+        Stop-DispatcherTimer $hoverState.CloseTimer
+        if ($hoverState.Window) {
+            try {
+                $hoverState.Window.Close()
+            } catch {
+            }
+            $hoverState.Window = $null
+        }
         if ($null -ne $script:CompactTopmostTimer) {
             $script:CompactTopmostTimer.Stop()
             $script:CompactTopmostTimer = $null
