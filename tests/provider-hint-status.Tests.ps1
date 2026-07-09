@@ -42,7 +42,7 @@ Describe "Provider hint and status helpers" {
         $status.ChipText | Should Be ("{0} RESET SOON" -f (Get-UiGlyph "reset"))
     }
 
-    It "builds a projection hint for grok from the weekly window" {
+    It "prefers reset-soon wording when the weekly reset is close" {
         $usage = [pscustomobject]@{
             ok = $true
             isStale = $false
@@ -56,10 +56,10 @@ Describe "Provider hint and status helpers" {
 
         $hint = Get-ProviderHint "grok" $usage
 
-        $hint.Text | Should Be "Pace: OK - projected 40% used at reset"
+        $hint.Text | Should Be "Reset is soon, you are fine."
     }
 
-    It "surfaces stale telemetry in the pace hint" {
+    It "surfaces stale telemetry with a waiting-for-fresh-data hint" {
         $usage = [pscustomobject]@{
             ok = $true
             isStale = $true
@@ -73,6 +73,6 @@ Describe "Provider hint and status helpers" {
 
         $hint = Get-ProviderHint "grok" $usage
 
-        $hint.Text.Contains("telemetry may be stale") | Should Be $true
+        $hint.Text | Should Be "Waiting for fresh data."
     }
 }

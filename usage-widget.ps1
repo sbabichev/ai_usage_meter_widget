@@ -676,6 +676,23 @@ function Write-WidgetLog($message) {
     }
 }
 
+function Invoke-GuardedUiAction($actionName, $action) {
+    if (-not $action) {
+        return $false
+    }
+
+    try {
+        & $action
+        return $true
+    } catch {
+        $exception = $_.Exception
+        $typeName = if ($exception) { $exception.GetType().FullName } else { "UnknownException" }
+        $message = if ($exception) { $exception.Message } else { $_.ToString() }
+        Write-WidgetLog ("UI callback failed [{0}] {1}: {2}" -f $actionName, $typeName, $message)
+        return $false
+    }
+}
+
 function Get-FileTailLines($path, $maxBytes) {
     try {
         $stream = [System.IO.File]::Open(
@@ -893,13 +910,15 @@ function Sync-CompactTopmostTimer($window) {
             $script:CompactTopmostTimer.Tag = $window
             $script:CompactTopmostTimer.Add_Tick({
                 param($sender)
-                if (-not $script:CompactMode) {
-                    $sender.Stop()
-                    $script:CompactTopmostTimer = $null
-                    return
-                }
+                Invoke-GuardedUiAction "CompactTopmostTimer.Tick" {
+                    if (-not $script:CompactMode) {
+                        $sender.Stop()
+                        $script:CompactTopmostTimer = $null
+                        return
+                    }
 
-                Set-WindowTopmost $sender.Tag
+                    Set-WindowTopmost $sender.Tag
+                } | Out-Null
             })
         } else {
             $script:CompactTopmostTimer.Tag = $window
@@ -4696,7 +4715,7 @@ function Get-FullWidgetHeight($controls) {
         return $script:WidgetHeight
     }
 
-    return [Math]::Max(120, [Math]::Min(600, [Math]::Ceiling($height + 28)))
+    return [Math]::Max(120, [Math]::Min(600, [Math]::Ceiling($height + 30)))
 }
 
 function Move-WindowKeepingBottom($window, $oldBottom) {
@@ -4734,6 +4753,7 @@ function Set-WidgetMode($window, $controls, $compact, $saveState = $true, $prese
     if ($script:CompactMode) {
         $controls.FullContent.Visibility = "Collapsed"
         $controls.CompactContent.Visibility = "Visible"
+        $controls.Outer.Margin = "6"
         $controls.Outer.Padding = "8,4,8,4"
         $controls.Outer.CornerRadius = 14
 
@@ -4749,7 +4769,8 @@ function Set-WidgetMode($window, $controls, $compact, $saveState = $true, $prese
     } else {
         $controls.CompactContent.Visibility = "Collapsed"
         $controls.FullContent.Visibility = "Visible"
-        $controls.Outer.Padding = "12,10,12,4"
+        $controls.Outer.Margin = "6"
+        $controls.Outer.Padding = "10,10,10,6"
         $controls.Outer.CornerRadius = 16
 
         $window.SizeToContent = "Manual"
@@ -4806,7 +4827,7 @@ function Get-HoverDetailMeasuredHeight($outer) {
         return $script:WidgetHeight
     }
 
-    return [Math]::Max(120, [Math]::Min(600, [Math]::Ceiling($height + 12)))
+    return [Math]::Max(120, [Math]::Min(600, [Math]::Ceiling($height)))
 }
 
 function Update-HoverDetailContent {
@@ -4859,10 +4880,11 @@ function Start-HoverDetailCloseTimer {
 
     Stop-HoverDetailCloseTimer
     if (-not $state.CloseTimer) {
-        $state.CloseTimer = New-Object System.Windows.Threading.DispatcherTimer
-        $state.CloseTimer.Interval = [TimeSpan]::FromMilliseconds($script:HoverDetailCloseDelayMs)
-        $state.CloseTimer.Add_Tick({
-            param($sender)
+    $state.CloseTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $state.CloseTimer.Interval = [TimeSpan]::FromMilliseconds($script:HoverDetailCloseDelayMs)
+    $state.CloseTimer.Add_Tick({
+        param($sender)
+        Invoke-GuardedUiAction "HoverDetailCloseTimer.Tick" {
             $sender.Stop()
             $hoverState = Get-HoverDetailState
             if ($hoverState.IsPointerOverPopup -or $hoverState.HoverProviderId) {
@@ -4870,7 +4892,8 @@ function Start-HoverDetailCloseTimer {
             }
 
             Hide-HoverDetailWindow
-        })
+        } | Out-Null
+    })
     }
 
     $state.CloseTimer.Start()
@@ -4939,6 +4962,8 @@ function Initialize-HoverDetailWindow($controls) {
     $window.Topmost = ($script:CompactMode -or $script:TopmostEnabled)
 
     $outer = New-WidgetOuterBorder
+    $outer.Margin = "6"
+    $outer.Padding = "10"
     $contentHost = New-Object System.Windows.Controls.StackPanel
     $contentHost.Margin = "0,0,0,0"
     $outer.Child = $contentHost
@@ -5012,20 +5037,22 @@ function Request-HoverDetailWindow($controls, $providerId, $sourcePanel) {
         $state.OpenTimer.Interval = [TimeSpan]::FromMilliseconds($script:HoverDetailOpenDelayMs)
         $state.OpenTimer.Add_Tick({
             param($sender)
-            $sender.Stop()
-            $hoverState = Get-HoverDetailState
-            if (-not $hoverState.Controls) {
-                return
-            }
+            Invoke-GuardedUiAction "HoverDetailOpenTimer.Tick" {
+                $sender.Stop()
+                $hoverState = Get-HoverDetailState
+                if (-not $hoverState.Controls) {
+                    return
+                }
 
-            $targetProviderId = [string]$hoverState.PendingProviderId
-            $targetPanel = $hoverState.SourcePanel
-            if (-not (Test-CanShowHoverDetail $targetProviderId)) {
-                Clear-HoverDetailPendingProvider
-                return
-            }
+                $targetProviderId = [string]$hoverState.PendingProviderId
+                $targetPanel = $hoverState.SourcePanel
+                if (-not (Test-CanShowHoverDetail $targetProviderId)) {
+                    Clear-HoverDetailPendingProvider
+                    return
+                }
 
-            Show-HoverDetailWindow $hoverState.Controls $targetProviderId $targetPanel
+                Show-HoverDetailWindow $hoverState.Controls $targetProviderId $targetPanel
+            } | Out-Null
         })
     }
 
@@ -5289,11 +5316,13 @@ function Start-CodexSessionWatcher($controls) {
     $timer.Tag = $controls
     $timer.Add_Tick({
         param($sender)
-        $currentKey = Get-CodexSessionChangeKey
-        if ($currentKey -and $currentKey -ne $script:CodexLastSessionChangeKey) {
-            $script:CodexLastSessionChangeKey = $currentKey
-            Update-Widget $sender.Tag
-        }
+        Invoke-GuardedUiAction "CodexSessionWatcher.Tick" {
+            $currentKey = Get-CodexSessionChangeKey
+            if ($currentKey -and $currentKey -ne $script:CodexLastSessionChangeKey) {
+                $script:CodexLastSessionChangeKey = $currentKey
+                Update-Widget $sender.Tag
+            }
+        } | Out-Null
     })
     $timer.Start()
     $script:CodexSessionChangeTimer = $timer
@@ -5381,7 +5410,7 @@ function Build-Widget {
 
     $outer = New-Object System.Windows.Controls.Border
     $outer.Margin = "6"
-    $outer.Padding = "12,10,12,4"
+    $outer.Padding = "10,10,10,6"
     $outer.CornerRadius = 16
     $outer.BorderThickness = 1
     $outer.BorderBrush = Get-Brush "#AAB7BD"
@@ -5435,19 +5464,23 @@ function Build-Widget {
     $window.Visibility = "Visible"
 
     $root.Add_Loaded({
-        Sync-ProviderVisibility $controls
-        Apply-CachedUsageSnapshot $controls $script:UsageSnapshot | Out-Null
+        Invoke-GuardedUiAction "Root.Loaded" {
+            Sync-ProviderVisibility $controls
+            Apply-CachedUsageSnapshot $controls $script:UsageSnapshot | Out-Null
 
-        $script:StartupRefreshTimer = New-Object System.Windows.Threading.DispatcherTimer
-        $script:StartupRefreshTimer.Interval = [TimeSpan]::FromMilliseconds(120)
-        $script:StartupRefreshTimer.Add_Tick({
-            param($sender)
-            $sender.Stop()
-            $script:StartupRefreshTimer = $null
-            Update-Widget $controls
-            Start-CodexSessionWatcher $controls
-        })
-        $script:StartupRefreshTimer.Start()
+            $script:StartupRefreshTimer = New-Object System.Windows.Threading.DispatcherTimer
+            $script:StartupRefreshTimer.Interval = [TimeSpan]::FromMilliseconds(120)
+            $script:StartupRefreshTimer.Add_Tick({
+                param($sender)
+                Invoke-GuardedUiAction "StartupRefreshTimer.Tick" {
+                    $sender.Stop()
+                    $script:StartupRefreshTimer = $null
+                    Update-Widget $controls
+                    Start-CodexSessionWatcher $controls
+                } | Out-Null
+            })
+            $script:StartupRefreshTimer.Start()
+        } | Out-Null
     })
 
     $controls = [pscustomobject]@{
@@ -5476,11 +5509,15 @@ function Build-Widget {
             $compactControl.panel.Tag = $providerId
             $compactControl.panel.Add_MouseEnter({
                 param($sender)
-                Handle-CompactProviderMouseEnter $controls ([string]$sender.Tag) $sender
+                Invoke-GuardedUiAction "CompactProvider.MouseEnter" {
+                    Handle-CompactProviderMouseEnter $controls ([string]$sender.Tag) $sender
+                } | Out-Null
             })
             $compactControl.panel.Add_MouseLeave({
                 param($sender)
-                Handle-CompactProviderMouseLeave ([string]$sender.Tag)
+                Invoke-GuardedUiAction "CompactProvider.MouseLeave" {
+                    Handle-CompactProviderMouseLeave ([string]$sender.Tag)
+                } | Out-Null
             })
         }
     }
@@ -5489,7 +5526,9 @@ function Build-Widget {
 
     $contextMenuOpeningHandler = {
         param($sender, $event)
-        $sender.ContextMenu = Build-ProviderContextMenu $window $controls
+        Invoke-GuardedUiAction "ContextMenu.Opening" {
+            $sender.ContextMenu = Build-ProviderContextMenu $window $controls
+        } | Out-Null
     }
 
     $outer.ContextMenu = Build-ProviderContextMenu $window $controls
@@ -5503,67 +5542,81 @@ function Build-Widget {
 
     $dragHandler = {
         param($sender, $event)
-        Hide-HoverDetailWindow
-        if ($event.ClickCount -ge 2) {
-            Toggle-WidgetMode $window $controls
-            $event.Handled = $true
-            return
-        }
+        Invoke-GuardedUiAction "Outer.MouseLeftButtonDown" {
+            Hide-HoverDetailWindow
+            if ($event.ClickCount -ge 2) {
+                Toggle-WidgetMode $window $controls
+                $event.Handled = $true
+                return
+            }
 
-        if ([System.Windows.Input.Mouse]::LeftButton -eq [System.Windows.Input.MouseButtonState]::Pressed) {
-            try { $window.DragMove() } catch { }
-        }
+            if ([System.Windows.Input.Mouse]::LeftButton -eq [System.Windows.Input.MouseButtonState]::Pressed) {
+                try { $window.DragMove() } catch { }
+            }
+        } | Out-Null
     }
     $outer.Add_MouseLeftButtonDown($dragHandler)
 
     $window.Add_LocationChanged({
-        $hoverState = Get-HoverDetailState
-        if ($hoverState.Window -and $hoverState.Window.IsVisible) {
-            Set-HoverDetailWindowPosition $hoverState.Window $hoverState.SourcePanel
-        }
-        if ($script:CompactMode) {
-            Sync-CompactTopmostTimer $window
-        }
-        Save-State $window
+        Invoke-GuardedUiAction "Window.LocationChanged" {
+            $hoverState = Get-HoverDetailState
+            if ($hoverState.Window -and $hoverState.Window.IsVisible) {
+                Set-HoverDetailWindowPosition $hoverState.Window $hoverState.SourcePanel
+            }
+            if ($script:CompactMode) {
+                Sync-CompactTopmostTimer $window
+            }
+            Save-State $window
+        } | Out-Null
     })
     $window.Add_Deactivated({
-        Start-HoverDetailCloseTimer
-        if ($script:CompactMode) {
-            Sync-CompactTopmostTimer $window
-        }
+        Invoke-GuardedUiAction "Window.Deactivated" {
+            Start-HoverDetailCloseTimer
+            if ($script:CompactMode) {
+                Sync-CompactTopmostTimer $window
+            }
+        } | Out-Null
     })
     $window.Add_Activated({
-        if ($script:CompactMode) {
-            Sync-CompactTopmostTimer $window
-        }
+        Invoke-GuardedUiAction "Window.Activated" {
+            if ($script:CompactMode) {
+                Sync-CompactTopmostTimer $window
+            }
+        } | Out-Null
     })
     $window.Add_Closed({
-        Hide-HoverDetailWindow
-        $hoverState = Get-HoverDetailState
-        Stop-DispatcherTimer $hoverState.OpenTimer
-        Stop-DispatcherTimer $hoverState.CloseTimer
-        if ($hoverState.Window) {
-            try {
-                $hoverState.Window.Close()
-            } catch {
+        Invoke-GuardedUiAction "Window.Closed" {
+            Hide-HoverDetailWindow
+            $hoverState = Get-HoverDetailState
+            Stop-DispatcherTimer $hoverState.OpenTimer
+            Stop-DispatcherTimer $hoverState.CloseTimer
+            if ($hoverState.Window) {
+                try {
+                    $hoverState.Window.Close()
+                } catch {
+                }
+                $hoverState.Window = $null
             }
-            $hoverState.Window = $null
-        }
-        if ($null -ne $script:CompactTopmostTimer) {
-            $script:CompactTopmostTimer.Stop()
-            $script:CompactTopmostTimer = $null
-        }
-        Stop-CodexSessionWatcher
-        Save-State $window
-        if ($null -ne $tray) {
-            $tray.Visible = $false
-            $tray.Dispose()
-        }
+            if ($null -ne $script:CompactTopmostTimer) {
+                $script:CompactTopmostTimer.Stop()
+                $script:CompactTopmostTimer = $null
+            }
+            Stop-CodexSessionWatcher
+            Save-State $window
+            if ($null -ne $tray) {
+                $tray.Visible = $false
+                $tray.Dispose()
+            }
+        } | Out-Null
     })
 
     $timer = New-Object System.Windows.Threading.DispatcherTimer
     $timer.Interval = [TimeSpan]::FromSeconds([Math]::Max(1, [int]$state.refreshSeconds))
-    $timer.Add_Tick({ Update-Widget $controls })
+    $timer.Add_Tick({
+        Invoke-GuardedUiAction "WidgetRefreshTimer.Tick" {
+            Update-Widget $controls
+        } | Out-Null
+    })
     $timer.Start()
 
     $window.ShowDialog()

@@ -17,8 +17,8 @@ Describe "Shared provider rendering regressions" {
         $windows = @(Get-ProviderUsageWindows $metadata $usage)
 
         $windows.Count | Should Be 2
-        $windows[0].title | Should Be "CURRENT SESSION"
-        $windows[1].title | Should Be "WEEKLY"
+        $windows[0].title | Should Be "Session"
+        $windows[1].title | Should Be "Weekly"
     }
 
     It "keeps Grok mapped to a single weekly window" {
@@ -34,6 +34,6 @@ Describe "Shared provider rendering regressions" {
         $windows = @(Get-ProviderUsageWindows $metadata $usage)
 
         $windows.Count | Should Be 1
-        $windows[0].title | Should Be "WEEKLY"
+        $windows[0].title | Should Be "Weekly"
     }
 }
