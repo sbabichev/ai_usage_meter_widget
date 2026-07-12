@@ -1,4 +1,4 @@
-﻿{
+{
     "accountName":  "Nurullah",
     "planName":  "Max 20x",
     "usageUrl":  "https://claude.ai/settings/usage",
@@ -45,11 +45,16 @@
                  "logPath":  "",
                  "staleAfterSeconds":  900,
                  "apiTimeoutSeconds":  12
-                },
+             },
     "window":  {
                    "left":  0,
                    "top":  1652,
                    "opacity":  0.96,
                    "topmost":  true
-               }
+               },
+    "hoverOpenDelayMs":  2000,
+    "antigravity":  {
+                        "pool":  "gemini",
+                        "enabled":  false
+                    }
 }

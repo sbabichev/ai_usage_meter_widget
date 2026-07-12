@@ -54,8 +54,8 @@ $script:IconPath = Join-Path $script:AppDir "assets\codex-usage-meter.ico"
 $script:CodexUsageDashboardUrl = "https://chatgpt.com/codex/settings/usage"
 $script:WidgetWidth = 360
 $script:WidgetHeight = 430
-$script:CompactSingleWidth = 270
-$script:CompactDoubleWidth = 520
+$script:CompactSingleWidth = 240
+$script:CompactDoubleWidth = 460
 $script:CompactHeight = 62
 $script:CompactMultiRowHeight = 116
 $script:StaleAfterSeconds = 900
@@ -74,6 +74,11 @@ $script:GrokRemoteState = @{
     Error = $null
     RefreshStatus = $null
 }
+$script:AntigravityRemoteState = @{
+    Usage = $null
+    Error = $null
+    RefreshStatus = $null
+}
 $script:CodexEnabled = $true
 $script:MinimaxEnabled = $true
 $script:CompactMode = $false
@@ -85,7 +90,7 @@ $script:CompactTopmostTimer = $null
 $script:CodexSessionChangeTimer = $null
 $script:CodexLastSessionChangeKey = ""
 $script:FullWidgetHeight = $script:WidgetHeight
-$script:HoverDetailOpenDelayMs = 320
+$script:HoverDetailOpenDelayMs = 2000
 $script:HoverDetailCloseDelayMs = 140
 $script:HoverDetailState = $null
 $script:UsageFloorState = @{
@@ -138,6 +143,20 @@ function New-ProviderMetadataMap {
             actionLabel = "API"
             actionToolTip = "Check via API"
             defaultWindows = @("Weekly")
+        }
+        antigravity = [pscustomobject]@{
+            id = "antigravity"
+            label = "Google Antigravity"
+            title = "ANTIGRAVITY"
+            accent = "#4285F4"
+            defaultEnabled = $false
+            defaultVisible = $true
+            supportsActivity = $false
+            supportsHint = $true
+            supportsRefresh = $true
+            actionLabel = "AGY"
+            actionToolTip = "Read latest AGY statusline snapshot"
+            defaultWindows = @("Session", "Weekly")
         }
     }
 }
@@ -1348,6 +1367,21 @@ function Restore-UsageSnapshot($snapshot) {
     }
 }
 
+function Restore-GrokRuntimeUsage($snapshot) {
+    $restored = Restore-UsageSnapshot $snapshot
+    if (-not $restored -or -not $restored.Providers) {
+        return $null
+    }
+
+    $usage = Get-ObjectValue $restored.Providers "grok" $null
+    if ($usage -and $usage.ok -and $usage.primary) {
+        $script:GrokRemoteState.Usage = Set-GrokUsageFreshness $usage (Get-GrokSettings).StaleAfterSeconds
+        return $script:GrokRemoteState.Usage
+    }
+
+    return $null
+}
+
 function Initialize-UsageFloorState($state) {
     $script:UsageFloorState = @{
         WindowKey = ""
@@ -1416,7 +1450,10 @@ function Format-CompactDuration($span) {
     if ($span.TotalDays -ge 1) {
         $days = [Math]::Floor($span.TotalDays)
         $hours = $span.Hours
-        return if ($hours -gt 0) { "{0}d{1}h" -f $days, $hours } else { "{0}d" -f $days }
+        if ($hours -gt 0) {
+            return "{0}d{1}h" -f $days, $hours
+        }
+        return "{0}d" -f $days
     }
 
     if ($span.TotalHours -ge 1) {
@@ -2553,11 +2590,15 @@ function Test-UsableCodexRateLimits($limits) {
         return $false
     }
 
-    if (-not $limits.primary -or -not $limits.secondary) {
+    if (-not $limits.primary) {
         return $false
     }
 
-    if ($null -eq $limits.primary.used_percent -or $null -eq $limits.secondary.used_percent) {
+    if ($null -eq $limits.primary.used_percent) {
+        return $false
+    }
+
+    if ($limits.secondary -and $null -eq $limits.secondary.used_percent) {
         return $false
     }
 
@@ -2644,7 +2685,11 @@ function Get-RateLimitHistory($limitId = "codex") {
         Test-RateLimitWindowMatches $_.PrimaryReset $_.SecondaryReset $latest.PrimaryReset $latest.SecondaryReset
     }
     $windowPrimaryMax = ($sameWindow | Measure-Object -Property PrimaryUsed -Maximum).Maximum
-    $windowSecondaryMax = ($sameWindow | Measure-Object -Property SecondaryUsed -Maximum).Maximum
+    $windowSecondaryMax = if ($latest.Event.payload.rate_limits.secondary) {
+        ($sameWindow | Measure-Object -Property SecondaryUsed -Maximum).Maximum
+    } else {
+        $null
+    }
     $reachedType = $sameWindow |
         Where-Object { -not [string]::IsNullOrWhiteSpace($_.RateLimitReachedType) } |
         Sort-Object Stamp -Descending |
@@ -2662,7 +2707,7 @@ function Get-RateLimitHistory($limitId = "codex") {
         $latest.PrimaryUsed = $windowPrimaryMax
         $latest.Event.payload.rate_limits.primary.used_percent = $windowPrimaryMax
     }
-    if ($windowSecondaryMax -gt $latest.SecondaryUsed) {
+    if ($latest.Event.payload.rate_limits.secondary -and $windowSecondaryMax -gt $latest.SecondaryUsed) {
         $latest.SecondaryUsed = $windowSecondaryMax
         $latest.Event.payload.rate_limits.secondary.used_percent = $windowSecondaryMax
     }
@@ -2685,13 +2730,13 @@ function Get-RateLimitHistory($limitId = "codex") {
 }
 
 function Apply-UsageFloor($limits) {
-    if (-not $limits -or -not $limits.primary -or -not $limits.secondary) {
+    if (-not $limits -or -not $limits.primary) {
         return
     }
 
     $windowKey = Get-RateLimitWindowKey $limits.primary.resets_at $limits.secondary.resets_at
     $primaryCurrent = Convert-ToNumber $limits.primary.used_percent
-    $secondaryCurrent = Convert-ToNumber $limits.secondary.used_percent
+    $secondaryCurrent = if ($limits.secondary) { Convert-ToNumber $limits.secondary.used_percent } else { $null }
 
     if (-not (Test-RateLimitWindowKeyMatches $script:UsageFloorState.WindowKey $limits.primary.resets_at $limits.secondary.resets_at)) {
         $script:UsageFloorState.WindowKey = $windowKey
@@ -2704,19 +2749,23 @@ function Apply-UsageFloor($limits) {
             $script:UsageFloorState.PrimaryUsed = [Math]::Max($script:UsageFloorState.PrimaryUsed, $primaryCurrent)
         }
 
-        if ($null -eq $script:UsageFloorState.SecondaryUsed) {
-            $script:UsageFloorState.SecondaryUsed = $secondaryCurrent
-        } else {
-            $script:UsageFloorState.SecondaryUsed = [Math]::Max($script:UsageFloorState.SecondaryUsed, $secondaryCurrent)
+        if ($limits.secondary) {
+            if ($null -eq $script:UsageFloorState.SecondaryUsed) {
+                $script:UsageFloorState.SecondaryUsed = $secondaryCurrent
+            } else {
+                $script:UsageFloorState.SecondaryUsed = [Math]::Max($script:UsageFloorState.SecondaryUsed, $secondaryCurrent)
+            }
         }
     }
 
     $limits.primary.used_percent = $script:UsageFloorState.PrimaryUsed
-    $limits.secondary.used_percent = $script:UsageFloorState.SecondaryUsed
+    if ($limits.secondary) {
+        $limits.secondary.used_percent = $script:UsageFloorState.SecondaryUsed
+    }
 }
 
 function Apply-CodexRateLimitReached($limits) {
-    if (-not $limits -or -not $limits.primary -or -not $limits.secondary) {
+    if (-not $limits -or -not $limits.primary) {
         return
     }
 
@@ -2726,7 +2775,7 @@ function Apply-CodexRateLimitReached($limits) {
     }
 
     $text = $reachedType.ToString().ToLowerInvariant()
-    if ($text -match "secondary|weekly|week") {
+    if ($limits.secondary -and $text -match "secondary|weekly|week") {
         $limits.secondary.used_percent = 100
         return
     }
@@ -3055,6 +3104,102 @@ function Get-MinimaxUsage {
             secondary = $null
         }
     }
+}
+
+function Get-AntigravitySettings {
+    $config = Read-Config
+    $antigravity = Get-ProviderConfigObject $config "antigravity"
+    return [pscustomobject]@{
+        Enabled = Convert-ToBoolean (Get-ObjectValue $antigravity "enabled" $null) $false
+        Pool = Get-ObjectValue $antigravity "pool" "gemini"
+        SnapshotPath = Get-ObjectValue $antigravity "snapshotPath" (Join-Path $env:LOCALAPPDATA "CodexUsageMeter\antigravity-quota.json")
+    }
+}
+
+function Invoke-AntigravityLiveFetch {
+    $settings = Get-AntigravitySettings
+    $snapshotFile = $settings.SnapshotPath
+    
+    if (-not (Test-Path $snapshotFile)) {
+        return [pscustomobject]@{ Usage = $null; Error = "AGY snapshot not found. Start AGY with the statusline bridge."; Status = "error" }
+    }
+    
+    try {
+        $content = Get-Content -Path $snapshotFile -Raw -Encoding UTF8
+        $data = $content | ConvertFrom-Json
+        $pool = Get-ObjectValue (Get-ObjectValue $data "pools" $null) $settings.Pool $null
+        if (-not $pool) { throw "AGY pool '$($settings.Pool)' is unavailable in the latest snapshot." }
+        $convertWindow = {
+            param($source, $label, $title, $windowMinutes)
+            if (-not $source) { return $null }
+            $remaining = [Math]::Max([double]0, [Math]::Min([double]1, [double](Get-ObjectValue $source "remaining_fraction" 0)))
+            $reset = Get-ObjectValue $source "resets_at" $null
+            $resetSeconds = Convert-ToUnixTimestamp $reset
+            return [pscustomobject]@{ label = $label; title = $title; total = $null; used = $null; used_percent = [Math]::Round((1 - $remaining) * 100, 1); resets_at = $resetSeconds; window_minutes = $windowMinutes }
+        }
+        $updated = [datetime](Get-ObjectValue $data "captured_at" (Get-Date))
+        $age = (Get-Date).ToUniversalTime() - $updated.ToUniversalTime()
+        
+        $usage = [pscustomobject]@{
+            ok = $true
+            configured = $true
+            message = "AGY $($settings.Pool) quota"
+            plan = Get-ObjectValue $data "plan_tier" "Antigravity"
+            updated = $updated
+            isStale = $age.TotalSeconds -gt $script:StaleAfterSeconds
+            staleText = if ($age.TotalSeconds -gt $script:StaleAfterSeconds) { "AGY snapshot {0:N0}m old" -f [Math]::Floor($age.TotalMinutes) } else { "" }
+            primary = & $convertWindow (Get-ObjectValue $pool "current" $null) "Session" "Current session" 300
+            secondary = & $convertWindow (Get-ObjectValue $pool "weekly" $null) "Weekly" "Weekly limit" 10080
+        }
+        
+        return [pscustomobject]@{ Usage = $usage; Error = $null; Status = "success" }
+    } catch {
+        return [pscustomobject]@{ Usage = $null; Error = "Failed to read AGY snapshot."; Status = "error" }
+    }
+}
+
+function Invoke-AntigravityManualRefresh($controls) {
+    if ($null -ne $script:AntigravityRefreshTask) { return $false }
+    $settings = Get-AntigravitySettings
+    if (-not $settings.Enabled) { return $false }
+    
+    $script:AntigravityRefreshTask = [System.Threading.Tasks.Task]::Run({
+        $result = Invoke-AntigravityLiveFetch
+        $controls.Window.Dispatcher.Invoke([Action] {
+            $script:AntigravityRefreshTask = $null
+            if ($result.Status -eq "success" -and $result.Usage) {
+                $script:AntigravityRemoteState.Usage = $result.Usage
+                $script:AntigravityRemoteState.Usage.error = $null
+            } elseif ($script:AntigravityRemoteState.Usage) {
+                $script:AntigravityRemoteState.Usage.error = $result.Error
+            }
+            $script:AntigravityRemoteState.Error = $result.Error
+            $script:AntigravityRemoteState.RefreshStatus = $result.Status
+            Update-Widget $controls
+            $null = Set-ProviderActionStatus "antigravity" $result.Status (if ($result.Status -eq "success") { "OK" } else { "err" }) $result.Error
+            $control = Get-ObjectValue $controls.ProviderSections "antigravity" $null
+            if ($control) { Update-ProviderActionButton $control }
+        })
+    })
+    return $true
+}
+
+function Get-AntigravityUsage {
+    $settings = Get-AntigravitySettings
+    if (-not $settings.Enabled) {
+        return [pscustomobject]@{ ok = $false; configured = $false; message = "Antigravity not configured"; plan = "unknown"; updated = Get-Date; primary = $null; secondary = $null }
+    }
+    
+    $result = Invoke-AntigravityLiveFetch
+    if ($result.Status -eq "success") {
+        $script:AntigravityRemoteState.Usage = $result.Usage
+        $script:AntigravityRemoteState.Error = $null
+    } elseif (-not $script:AntigravityRemoteState.Usage) {
+        return [pscustomobject]@{ ok = $false; configured = $true; message = "Antigravity usage unavailable"; plan = "unknown"; updated = Get-Date; error = $result.Error; primary = $null; secondary = $null }
+    } else {
+        $script:AntigravityRemoteState.Usage.error = $result.Error
+    }
+    return $script:AntigravityRemoteState.Usage
 }
 
 function Get-GrokSettings {
@@ -3878,15 +4023,17 @@ function Get-ProviderUsageWindows($metadata, $usage) {
     $defaultTitles = @($metadata.defaultWindows)
 
     if ($usage -and $usage.primary) {
+        $primaryMinutes = Convert-ToInt64 (Get-ObjectValue $usage.primary "window_minutes" 0)
         $windows += [pscustomobject]@{
-            title = if ($defaultTitles.Count -ge 1) { $defaultTitles[0] } else { "LIMIT" }
+            title = if ($primaryMinutes -ge 8640) { "Weekly" } elseif ($defaultTitles.Count -ge 1) { $defaultTitles[0] } else { "LIMIT" }
             limit = $usage.primary
         }
     }
 
     if ($usage -and $usage.secondary) {
+        $secondaryMinutes = Convert-ToInt64 (Get-ObjectValue $usage.secondary "window_minutes" 0)
         $windows += [pscustomobject]@{
-            title = if ($defaultTitles.Count -ge 2) { $defaultTitles[1] } else { "Weekly" }
+            title = if ($secondaryMinutes -ge 8640) { "Weekly" } elseif ($defaultTitles.Count -ge 2) { $defaultTitles[1] } else { "LIMIT" }
             limit = $usage.secondary
         }
     }
@@ -4461,18 +4608,19 @@ function New-CompactProviderPanel($name, $accentColor) {
     $label.VerticalAlignment = "Center"
 
     $percentText = New-NumericTextBlock "--" 16 "Light" "#A6FF4F"
-    $percentText.Margin = "10,-2,0,0"
+    $percentText.Margin = "6,-2,0,0"
     $percentText.VerticalAlignment = "Center"
     [System.Windows.Controls.Grid]::SetColumn($percentText, 1)
 
     $timeText = New-NumericTextBlock "" 9.0 "Regular" "#D6E2E8"
-    $timeText.Margin = "10,1,0,0"
+    $timeText.Margin = "6,1,0,0"
     $timeText.Opacity = 0.82
     $timeText.VerticalAlignment = "Center"
+    $timeText.HorizontalAlignment = "Right"
     [System.Windows.Controls.Grid]::SetColumn($timeText, 2)
 
     $weeklyText = New-NumericTextBlock "W --" 9.0 "SemiBold" "#D6E2E8"
-    $weeklyText.Margin = "10,1,0,0"
+    $weeklyText.Margin = "6,1,0,0"
     $weeklyText.Opacity = 0.78
     $weeklyText.VerticalAlignment = "Center"
     [System.Windows.Controls.Grid]::SetColumn($weeklyText, 3)
@@ -4599,6 +4747,7 @@ function Update-ProviderSection($control, $usage, $activity) {
         if ($i -lt $windows.Count) {
             $window = $windows[$i]
             $row.panel.Visibility = "Visible"
+            $row.title.Text = $window.title
             $status = if ($row.isPrimary) { Get-UsageStatus $window.limit $usage.isStale (Get-ObjectValue $usage "limitReachedType" $null) } else { $null }
             Update-LimitRow $row $window.limit (Format-ResetLabel $window.limit.resets_at) (Format-Remaining $window.limit.resets_at) $status
         } else {
@@ -5174,11 +5323,12 @@ function Format-ProviderUpdatedText($usage, $providerId = $null) {
     return "{0} / {1}" -f $baseText, $actionSummary
 }
 
-function Apply-WidgetData($controls, $usage, $minimax, $activity, $grok = $null) {
+function Apply-WidgetData($controls, $usage, $minimax, $activity, $grok = $null, $antigravity = $null) {
     $providerUsageMap = [ordered]@{
         codex = $usage
         minimax = $minimax
         grok = $grok
+        antigravity = $antigravity
     }
 
     foreach ($providerId in (Get-ProviderIds)) {
@@ -5199,7 +5349,7 @@ function Apply-WidgetData($controls, $usage, $minimax, $activity, $grok = $null)
 
     Update-HoverDetailSnapshot $controls $providerUsageMap $activity
 
-    $statusUsage = @($usage, $minimax, $grok) | Where-Object { $_ -and $_.ok } | Select-Object -First 1
+    $statusUsage = @($usage, $minimax, $grok, $antigravity) | Where-Object { $_ -and $_.ok } | Select-Object -First 1
     $controls.Updated.Text = if ($statusUsage) { "Updated " + (Format-ProviderUpdatedText $statusUsage) } else { "Updated " + (Get-Date).ToString("HH:mm:ss") }
 }
 
@@ -5210,7 +5360,8 @@ function Apply-CachedUsageSnapshot($controls, $snapshot) {
     }
 
     $grok = if ($restored.Providers) { Get-ObjectValue $restored.Providers "grok" $null } else { $null }
-    Apply-WidgetData $controls $restored.Codex $restored.Minimax $restored.Activity $grok
+    $antigravity = if ($restored.Providers) { Get-ObjectValue $restored.Providers "antigravity" $null } else { $null }
+    Apply-WidgetData $controls $restored.Codex $restored.Minimax $restored.Activity $grok $antigravity
     return $true
 }
 
@@ -5225,11 +5376,20 @@ function Invoke-ProviderRefreshAction($providerId, $controls) {
         return
     }
 
-    $null = Set-ProviderActionStatus $providerId "running" "api..." "Checking provider API"
+    $actionLabel = Get-ObjectValue $metadata "actionLabel" "Refresh"
+    $actionToolTip = "Checking provider API"
+    if ($providerId -eq "antigravity") {
+        $actionToolTip = "Reading latest AGY statusline snapshot"
+    }
+    $null = Set-ProviderActionStatus $providerId "running" ("{0}..." -f $actionLabel.ToLowerInvariant()) $actionToolTip
     $control = Get-ObjectValue $controls.ProviderSections $providerId $null
     if ($control) {
         Update-ProviderActionButton $control
-        $control.Updated.Text = Format-ProviderUpdatedText $script:GrokRemoteState.Usage $providerId
+        $providerUsage = $script:GrokRemoteState.Usage
+        if ($providerId -eq "antigravity") {
+            $providerUsage = $script:AntigravityRemoteState.Usage
+        }
+        $control.Updated.Text = Format-ProviderUpdatedText $providerUsage $providerId
         try {
             $controls.Window.Dispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::Render)
         } catch {
@@ -5239,6 +5399,9 @@ function Invoke-ProviderRefreshAction($providerId, $controls) {
     switch ($providerId) {
         "grok" {
             Invoke-GrokManualRefresh $controls | Out-Null
+        }
+        "antigravity" {
+            Invoke-AntigravityManualRefresh $controls | Out-Null
         }
     }
 }
@@ -5256,14 +5419,20 @@ function Update-Widget($controls) {
     } else {
         $script:GrokRemoteState.Usage
     }
+    $antigravity = if ([bool](Get-ObjectValue $script:ProviderEnabledMap "antigravity" $false)) {
+        Get-AntigravityUsage
+    } else {
+        $script:AntigravityRemoteState.Usage
+    }
 
-    Apply-WidgetData $controls $usage $minimax $activity $grok
+    Apply-WidgetData $controls $usage $minimax $activity $grok $antigravity
 
-    if (($usage -and $usage.ok) -or ($minimax -and $minimax.ok) -or ($grok -and $grok.ok)) {
+    if (($usage -and $usage.ok) -or ($minimax -and $minimax.ok) -or ($grok -and $grok.ok) -or ($antigravity -and $antigravity.ok)) {
         $providerUsageMap = [ordered]@{
             codex = $usage
             minimax = $minimax
             grok = $grok
+            antigravity = $antigravity
         }
         $script:UsageSnapshot = New-UsageSnapshot $usage $minimax $activity $providerUsageMap
         Save-State $controls.Window
@@ -5382,6 +5551,8 @@ function Build-Widget {
     $script:UsageDisplayMode = Normalize-UsageDisplayMode (Get-ObjectValue $state "displayMode" "used")
     $script:TopmostEnabled = [bool](Get-ObjectValue $state "topmost" $true)
     $script:UsageSnapshot = Get-ObjectValue $state "usageSnapshot" $null
+    Restore-GrokRuntimeUsage $script:UsageSnapshot | Out-Null
+    $script:HoverDetailOpenDelayMs = [int](Get-ObjectValue $config "hoverOpenDelayMs" 2000)
 
     $window = New-Object System.Windows.Window
     $window.Title = "AI Usage Meter"

@@ -77,6 +77,7 @@ Example local config:
 
 ```json
 {
+  "hoverOpenDelayMs": 2000,
   "minimax": {
     "enabled": true,
     "source": "token_plan",

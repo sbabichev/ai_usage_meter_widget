@@ -36,4 +36,36 @@ Describe "Shared provider rendering regressions" {
         $windows.Count | Should Be 1
         $windows[0].title | Should Be "Weekly"
     }
+
+    It "uses a single weekly Codex limit when the session window is absent" {
+        $metadata = Get-ProviderMetadata "codex"
+        $usage = [pscustomobject]@{
+            ok = $true
+            primary = [pscustomobject]@{
+                used_percent = 8
+                window_minutes = 10080
+                resets_at = 1784487810
+            }
+            secondary = $null
+        }
+
+        $windows = @(Get-ProviderUsageWindows $metadata $usage)
+
+        $windows.Count | Should Be 1
+        $windows[0].title | Should Be "Weekly"
+    }
+
+    It "accepts current Codex telemetry with only the weekly limit" {
+        $limits = [pscustomobject]@{
+            limit_id = "codex"
+            primary = [pscustomobject]@{
+                used_percent = 8
+                window_minutes = 10080
+                resets_at = 1784487810
+            }
+            secondary = $null
+        }
+
+        (Test-UsableCodexRateLimits $limits) | Should Be $true
+    }
 }

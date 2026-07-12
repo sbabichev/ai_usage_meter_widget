@@ -2,6 +2,10 @@ $env:USAGE_WIDGET_TEST_MODE = "1"
 . "$PSScriptRoot\..\usage-widget.ps1"
 
 Describe "Provider formatting helpers" {
+    It "formats multi-day reset durations without invoking if as a command" {
+        (Format-CompactDuration ([timespan]::FromDays(7).Add([timespan]::FromHours(3)))) | Should Be "7d3h"
+    }
+
     It "formats display percent with a suffix" {
         Format-DisplayPercent 23 | Should Be "23%"
         Format-DisplayPercent 100 | Should Be "100%"

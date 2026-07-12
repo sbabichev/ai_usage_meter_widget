@@ -73,4 +73,32 @@ Describe "Provider state helpers" {
         $restored.grok.primary.used_percent | Should Be 77
         $restored.grok.secondary | Should Be $null
     }
+
+    It "hydrates the Grok runtime cache from the saved snapshot" {
+        $originalUsage = $script:GrokRemoteState.Usage
+        try {
+            $script:GrokRemoteState.Usage = $null
+            $snapshot = [pscustomobject]@{
+                providers = [pscustomobject]@{
+                    grok = [pscustomobject]@{
+                        ok = $true
+                        updated = (Get-Date).ToString("o")
+                        primary = [pscustomobject]@{
+                            used_percent = 66
+                            resets_at = 300
+                            window_minutes = 10080
+                        }
+                        secondary = $null
+                    }
+                }
+            }
+
+            $usage = Restore-GrokRuntimeUsage $snapshot
+
+            $usage.primary.used_percent | Should Be 66
+            $script:GrokRemoteState.Usage.primary.used_percent | Should Be 66
+        } finally {
+            $script:GrokRemoteState.Usage = $originalUsage
+        }
+    }
 }
