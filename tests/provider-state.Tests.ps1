@@ -2,6 +2,23 @@ $env:USAGE_WIDGET_TEST_MODE = "1"
 . "$PSScriptRoot\..\usage-widget.ps1"
 
 Describe "Provider state helpers" {
+    It "does not poll a provider hidden by the Show menu" {
+        $originalEnabled = $script:ProviderEnabledMap
+        $originalVisibility = $script:ProviderVisibility
+        try {
+            $script:ProviderEnabledMap = [ordered]@{ minimax = $true }
+            $script:ProviderVisibility = [ordered]@{ minimax = $false }
+
+            (Test-ProviderPollingEnabled "minimax") | Should Be $false
+
+            $script:ProviderVisibility.minimax = $true
+            (Test-ProviderPollingEnabled "minimax") | Should Be $true
+        } finally {
+            $script:ProviderEnabledMap = $originalEnabled
+            $script:ProviderVisibility = $originalVisibility
+        }
+    }
+
     It "keeps enabled providers visible when legacy state does not contain them" {
         $rawVisibility = [pscustomobject]@{
             codex = $true

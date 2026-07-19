@@ -2,6 +2,27 @@ $env:USAGE_WIDGET_TEST_MODE = "1"
 . "$PSScriptRoot\..\usage-widget.ps1"
 
 Describe "Provider hint and status helpers" {
+    It "does not show an expired reset as due for a stale snapshot" {
+        $usage = [pscustomobject]@{ isStale = $true }
+        $display = Get-ProviderResetDisplay $usage ([DateTimeOffset]::Now.AddHours(-1).ToUnixTimeSeconds())
+
+        $display.ResetText | Should Match "Stale snapshot$"
+        $display.TimeText | Should Be "Waiting for fresh data"
+    }
+
+    It "suppresses reset status in compact mode for stale telemetry" {
+        $limit = [pscustomobject]@{
+            used_percent = 20
+            window_minutes = 300
+            resets_at = [DateTimeOffset]::Now.AddHours(-1).ToUnixTimeSeconds()
+        }
+
+        $status = Get-UsageStatus $limit $true
+
+        $status.Label | Should Be "STALE"
+        $status.CountdownText | Should Be "Waiting for fresh data"
+    }
+
     It "projects used percent at reset from elapsed pace" {
         $limit = [pscustomobject]@{
             used_percent = 40

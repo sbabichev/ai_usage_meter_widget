@@ -93,6 +93,13 @@ $script:FullWidgetHeight = $script:WidgetHeight
 $script:HoverDetailOpenDelayMs = 2000
 $script:HoverDetailCloseDelayMs = 140
 $script:HoverDetailState = $null
+$script:DetailedPanelState = $null
+$script:CompactPointerState = @{
+    Tracking = $false
+    Dragged = $false
+    StartPoint = $null
+}
+$script:CompactDragThreshold = 5
 $script:UsageFloorState = @{
     WindowKey = ""
     PrimaryUsed = $null
@@ -233,6 +240,10 @@ function Clear-HoverDetailPendingProvider {
 
 function Test-CanShowHoverDetail($providerId) {
     if (-not $script:CompactMode) {
+        return $false
+    }
+
+    if (Test-IsDetailedPanelVisible) {
         return $false
     }
 
@@ -524,6 +535,10 @@ function Get-VisibleProviderIds {
 
 function Test-ProviderVisible($providerId) {
     return [bool](Get-ObjectValue $script:ProviderVisibility $providerId $false)
+}
+
+function Test-ProviderPollingEnabled($providerId) {
+    return [bool](Get-ObjectValue $script:ProviderEnabledMap $providerId $false) -and (Test-ProviderVisible $providerId)
 }
 
 function Set-ProviderVisible($providerId, $visible) {
@@ -845,7 +860,7 @@ function Read-State {
         topmost = $true
         opacity = 1.0
         refreshSeconds = 3
-        compactMode = $false
+        compactMode = $true
         displayMode = "used"
         usageSnapshot = $null
         usageFloor = $null
@@ -917,7 +932,44 @@ function Set-WindowTopmost($window) {
 
     $hoverState = $script:HoverDetailState
     if ($hoverState -and $hoverState.Window -and $hoverState.Window -ne $window) {
-        $hoverState.Window.Topmost = $script:TopmostEnabled
+        $hoverState.Window.Topmost = $isTopmost
+        try {
+            $hoverHandle = ([System.Windows.Interop.WindowInteropHelper]::new($hoverState.Window)).Handle
+            if ($hoverHandle -ne [IntPtr]::Zero) {
+                $hoverInsertAfter = if ($isTopmost) { [NativeWindowTools]::HWND_TOPMOST } else { [NativeWindowTools]::HWND_NOTOPMOST }
+                [NativeWindowTools]::SetWindowPos(
+                    $hoverHandle,
+                    $hoverInsertAfter,
+                    0,
+                    0,
+                    0,
+                    0,
+                    [NativeWindowTools]::SWP_NOMOVE -bor [NativeWindowTools]::SWP_NOSIZE -bor [NativeWindowTools]::SWP_NOACTIVATE -bor [NativeWindowTools]::SWP_SHOWWINDOW
+                ) | Out-Null
+            }
+        } catch {
+        }
+    }
+
+    $detailedState = $script:DetailedPanelState
+    if ($detailedState -and $detailedState.Window -and $detailedState.Window -ne $window) {
+        $detailedState.Window.Topmost = $isTopmost
+        try {
+            $detailedHandle = ([System.Windows.Interop.WindowInteropHelper]::new($detailedState.Window)).Handle
+            if ($detailedHandle -ne [IntPtr]::Zero) {
+                $detailedInsertAfter = if ($isTopmost) { [NativeWindowTools]::HWND_TOPMOST } else { [NativeWindowTools]::HWND_NOTOPMOST }
+                [NativeWindowTools]::SetWindowPos(
+                    $detailedHandle,
+                    $detailedInsertAfter,
+                    0,
+                    0,
+                    0,
+                    0,
+                    [NativeWindowTools]::SWP_NOMOVE -bor [NativeWindowTools]::SWP_NOSIZE -bor [NativeWindowTools]::SWP_NOACTIVATE -bor [NativeWindowTools]::SWP_SHOWWINDOW
+                ) | Out-Null
+            }
+        } catch {
+        }
     }
 }
 
@@ -1555,6 +1607,17 @@ function Get-UsageStatus($limit, $isStale = $false, $limitReachedType = $null, $
 
     if ($null -eq $projection) {
         $projection = Get-UsageProjection $limit
+    }
+
+    if ($isStale) {
+        return [pscustomobject]@{
+            State = "wait"
+            Label = "STALE"
+            Icon = Get-UiGlyph "wait"
+            ChipText = ("{0} STALE" -f (Get-UiGlyph "wait"))
+            CountdownText = "Waiting for fresh data"
+            Palette = Get-StatusPalette "wait"
+        }
     }
 
     $remainingSpan = Get-RemainingSpan $limit.resets_at
@@ -4193,6 +4256,20 @@ function Format-ResetLabel($resetSeconds) {
     return ("{0} {1}" -f (Get-UiGlyph "reset"), $resetAt.LocalDateTime.ToString("MMM d, h:mm tt", [Globalization.CultureInfo]::InvariantCulture))
 }
 
+function Get-ProviderResetDisplay($usage, $resetSeconds) {
+    if ($usage -and $usage.isStale) {
+        return [pscustomobject]@{
+            ResetText = ("{0} Stale snapshot" -f (Get-UiGlyph "reset"))
+            TimeText = "Waiting for fresh data"
+        }
+    }
+
+    return [pscustomobject]@{
+        ResetText = Format-ResetLabel $resetSeconds
+        TimeText = Format-Remaining $resetSeconds
+    }
+}
+
 function Format-CompactRemaining($resetSeconds, $icon = $null) {
     if ($null -eq $icon) {
         $icon = Get-UiGlyph "reset"
@@ -4220,6 +4297,17 @@ function Get-UsageStatus($limit, $isStale = $false, $limitReachedType = $null, $
 
     if ($null -eq $projection) {
         $projection = Get-UsageProjection $limit
+    }
+
+    if ($isStale) {
+        return [pscustomobject]@{
+            State = "wait"
+            Label = "STALE"
+            Icon = Get-UiGlyph "wait"
+            ChipText = ("{0} STALE" -f (Get-UiGlyph "wait"))
+            CountdownText = "Waiting for fresh data"
+            Palette = Get-StatusPalette "wait"
+        }
     }
 
     $remainingSpan = Get-RemainingSpan $limit.resets_at
@@ -4749,7 +4837,8 @@ function Update-ProviderSection($control, $usage, $activity) {
             $row.panel.Visibility = "Visible"
             $row.title.Text = $window.title
             $status = if ($row.isPrimary) { Get-UsageStatus $window.limit $usage.isStale (Get-ObjectValue $usage "limitReachedType" $null) } else { $null }
-            Update-LimitRow $row $window.limit (Format-ResetLabel $window.limit.resets_at) (Format-Remaining $window.limit.resets_at) $status
+            $resetDisplay = Get-ProviderResetDisplay $usage $window.limit.resets_at
+            Update-LimitRow $row $window.limit $resetDisplay.ResetText $resetDisplay.TimeText $status
         } else {
             $row.panel.Visibility = "Collapsed"
         }
@@ -4816,6 +4905,8 @@ function Sync-ProviderVisibility($controls) {
 
     $controls.CompactContent.Columns = $compactColumns
     Set-WidgetMode $controls.Window $controls $script:CompactMode $false
+    Sync-HoverDetailVisibility $controls
+    Sync-DetailedPanelVisibility $controls
 }
 
 function Show-UsageWindow($window) {
@@ -4935,8 +5026,10 @@ function Set-WidgetMode($window, $controls, $compact, $saveState = $true, $prese
 
     if (-not $script:CompactMode) {
         Hide-HoverDetailWindow
+        Hide-DetailedPanelWindow
     } else {
         Sync-HoverDetailVisibility $controls
+        Sync-DetailedPanelVisibility $controls
     }
 
     if ($preserveBottom) {
@@ -4951,8 +5044,10 @@ function Set-WidgetMode($window, $controls, $compact, $saveState = $true, $prese
 }
 
 function Toggle-WidgetMode($window, $controls) {
-    $wasCompact = $script:CompactMode
-    Set-WidgetMode $window $controls (-not $script:CompactMode) $true $wasCompact
+    # Mode toggle on the main window is retired: compact stays put and detailed opens as a side panel.
+    if ($script:CompactMode) {
+        Toggle-DetailedPanelWindow $controls
+    }
 }
 
 function Get-HoverDetailMeasuredHeight($outer) {
@@ -5252,6 +5347,382 @@ function Sync-HoverDetailVisibility($controls = $null) {
     }
 }
 
+function New-DetailedPanelState($controls = $null) {
+    return [pscustomobject]@{
+        Controls = $controls
+        Window = $null
+        Outer = $null
+        Content = $null
+        ProviderSections = [ordered]@{}
+        IsOpen = $false
+        HasCustomPosition = $false
+        UsageMap = [ordered]@{}
+        Activity = $null
+    }
+}
+
+function Get-DetailedPanelState($controls = $null) {
+    if (-not $script:DetailedPanelState) {
+        $script:DetailedPanelState = New-DetailedPanelState $controls
+    } elseif ($controls) {
+        $script:DetailedPanelState.Controls = $controls
+    }
+
+    return $script:DetailedPanelState
+}
+
+function Test-IsDetailedPanelVisible {
+    $state = Get-DetailedPanelState
+    return [bool]($state.IsOpen -and $state.Window -and $state.Window.IsVisible)
+}
+
+function Get-DetailedPanelPlacement($popupSize, $workArea, $margin = 12) {
+    $width = [double]$(if ($popupSize.Width -gt 0) { $popupSize.Width } else { $script:WidgetWidth })
+    $height = [double]$(if ($popupSize.Height -gt 0) { $popupSize.Height } else { $script:WidgetHeight })
+
+    $left = $workArea.Right - $width - $margin
+    if ($left -lt $workArea.Left) {
+        $left = $workArea.Left
+    }
+
+    $maxLeft = [Math]::Max($workArea.Left, $workArea.Right - $width)
+    if ($left -gt $maxLeft) {
+        $left = $maxLeft
+    }
+
+    $top = $workArea.Top + (($workArea.Height - $height) / 2.0)
+    $maxTop = [Math]::Max($workArea.Top, $workArea.Bottom - $height)
+    if ($top -lt $workArea.Top) {
+        $top = $workArea.Top
+    }
+    if ($top -gt $maxTop) {
+        $top = $maxTop
+    }
+
+    return [pscustomobject]@{
+        Left = [Math]::Round($left)
+        Top = [Math]::Round($top)
+    }
+}
+
+function Get-DetailedPanelMeasuredHeight($content, $outer = $null) {
+    if (-not $content) {
+        return $script:WidgetHeight
+    }
+
+    $availableWidth = [Math]::Max(1, $script:WidgetWidth - 36)
+    $content.Measure([System.Windows.Size]::new($availableWidth, [double]::PositiveInfinity))
+    $height = $content.DesiredSize.Height
+
+    if ($height -le 0) {
+        try {
+            $content.UpdateLayout()
+            $height = $content.ActualHeight
+        } catch {
+            $height = 0
+        }
+    }
+
+    if ($height -le 0 -and $outer) {
+        $outer.Measure([System.Windows.Size]::new($availableWidth, [double]::PositiveInfinity))
+        $height = $outer.DesiredSize.Height
+    }
+
+    if ($height -le 0) {
+        return $script:WidgetHeight
+    }
+
+    return [Math]::Max(120, [Math]::Min(600, [Math]::Ceiling($height + 30)))
+}
+
+function Sync-DetailedPanelProviderVisibility($state = $null) {
+    if (-not $state) {
+        $state = Get-DetailedPanelState
+    }
+
+    if (-not $state.ProviderSections -or $state.ProviderSections.Count -eq 0) {
+        return
+    }
+
+    $visibleIds = Get-VisibleProviderIds
+    foreach ($providerId in (Get-ProviderIds)) {
+        $sectionControl = Get-ObjectValue $state.ProviderSections $providerId $null
+        if (-not $sectionControl) {
+            continue
+        }
+
+        $isVisible = $visibleIds -contains $providerId
+        $sectionControl.Section.Visibility = if ($isVisible) { "Visible" } else { "Collapsed" }
+        $sectionControl.Section.Margin = if ($isVisible -and $providerId -ne $visibleIds[-1]) { "0,0,0,8" } else { "0,0,0,0" }
+    }
+}
+
+function Update-DetailedPanelContent {
+    $state = Get-DetailedPanelState
+    if (-not $state.ProviderSections -or $state.ProviderSections.Count -eq 0) {
+        return
+    }
+
+    foreach ($providerId in (Get-ProviderIds)) {
+        $sectionControl = Get-ObjectValue $state.ProviderSections $providerId $null
+        if (-not $sectionControl) {
+            continue
+        }
+
+        $metadata = Get-ProviderMetadata $providerId
+        $providerUsage = Get-ObjectValue $state.UsageMap $providerId $null
+        $providerActivity = if ($metadata -and $metadata.supportsActivity) { $state.Activity } else { $null }
+        Update-ProviderSection $sectionControl $providerUsage $providerActivity
+    }
+}
+
+function Set-DetailedPanelDefaultPosition($window) {
+    if (-not $window) {
+        return
+    }
+
+    $workAreaBounds = [System.Windows.SystemParameters]::WorkArea
+    $workArea = [pscustomobject]@{
+        Left = [double]$workAreaBounds.Left
+        Top = [double]$workAreaBounds.Top
+        Width = [double]$workAreaBounds.Width
+        Height = [double]$workAreaBounds.Height
+        Right = [double]$workAreaBounds.Right
+        Bottom = [double]$workAreaBounds.Bottom
+    }
+
+    $popupSize = [pscustomobject]@{
+        Width = [double]$(if ($window.Width -gt 0) { $window.Width } else { $script:WidgetWidth })
+        Height = [double]$(if ($window.Height -gt 0) { $window.Height } else { $script:WidgetHeight })
+    }
+
+    $placement = Get-DetailedPanelPlacement $popupSize $workArea
+    $window.Left = $placement.Left
+    $window.Top = $placement.Top
+}
+
+function Resize-DetailedPanelWindow {
+    $state = Get-DetailedPanelState
+    if (-not $state.Window -or -not $state.Content) {
+        return
+    }
+
+    $height = Get-DetailedPanelMeasuredHeight $state.Content $state.Outer
+    $state.Window.Height = $height
+    $state.Window.MinHeight = $height
+    $state.Window.MaxHeight = $height
+
+    if (-not $state.HasCustomPosition) {
+        Set-DetailedPanelDefaultPosition $state.Window
+        return
+    }
+
+    $workArea = [System.Windows.SystemParameters]::WorkArea
+    $maxTop = [Math]::Max($workArea.Top, $workArea.Bottom - $height)
+    if ($state.Window.Top -gt $maxTop) {
+        $state.Window.Top = $maxTop
+    }
+    if ($state.Window.Top -lt $workArea.Top) {
+        $state.Window.Top = $workArea.Top
+    }
+}
+
+function Initialize-DetailedPanelWindow($controls) {
+    $state = Get-DetailedPanelState $controls
+    if ($state.Window) {
+        return $state.Window
+    }
+
+    $window = New-Object System.Windows.Window
+    $window.Title = "AI Usage Meter Detail"
+    $window.Width = $script:WidgetWidth
+    $window.MinWidth = $script:WidgetWidth
+    $window.MaxWidth = $script:WidgetWidth
+    $window.SizeToContent = "Manual"
+    $window.WindowStartupLocation = "Manual"
+    $window.WindowStyle = "None"
+    $window.AllowsTransparency = $true
+    $window.Background = [System.Windows.Media.Brushes]::Transparent
+    $window.UseLayoutRounding = $true
+    $window.SnapsToDevicePixels = $true
+    $window.ResizeMode = "NoResize"
+    $window.ShowInTaskbar = $false
+    $window.ShowActivated = $false
+    $window.Topmost = ($script:CompactMode -or $script:TopmostEnabled)
+    if ($controls -and $controls.Window) {
+        $window.Owner = $controls.Window
+    }
+
+    $outer = New-WidgetOuterBorder
+    $outer.Margin = "6"
+    $outer.Padding = "10,10,10,6"
+
+    $content = New-Object System.Windows.Controls.StackPanel
+    $content.Margin = "0,0,0,0"
+    $providerSections = [ordered]@{}
+    foreach ($providerId in (Get-ProviderIds)) {
+        $metadata = Get-ProviderMetadata $providerId
+        $providerSection = New-ProviderSection $metadata
+        $providerSections[$providerId] = $providerSection
+        $content.Children.Add($providerSection.Section) | Out-Null
+
+        if ($providerSection.ActionButton) {
+            $providerSection.ActionButton.Tag = $providerId
+            $providerSection.ActionButton.Add_Click({
+                param($sender)
+                $detailState = Get-DetailedPanelState
+                Invoke-ProviderRefreshAction ([string]$sender.Tag) $detailState.Controls
+            })
+        }
+    }
+
+    $outer.Child = $content
+    $window.Content = $outer
+
+    $dragHandler = {
+        param($sender, $event)
+        Invoke-GuardedUiAction "DetailedPanel.MouseLeftButtonDown" {
+            if ($event.ChangedButton -ne [System.Windows.Input.MouseButton]::Left) {
+                return
+            }
+
+            if ([System.Windows.Input.Mouse]::LeftButton -eq [System.Windows.Input.MouseButtonState]::Pressed) {
+                $detailState = Get-DetailedPanelState
+                $detailState.HasCustomPosition = $true
+                try { $detailState.Window.DragMove() } catch { }
+            }
+        } | Out-Null
+    }
+    $outer.Add_MouseLeftButtonDown($dragHandler)
+
+    $window.Add_LocationChanged({
+        Invoke-GuardedUiAction "DetailedPanel.LocationChanged" {
+            $detailState = Get-DetailedPanelState
+            if ($detailState.Window -and $detailState.Window.IsVisible) {
+                $detailState.HasCustomPosition = $true
+            }
+        } | Out-Null
+    })
+
+    $window.Add_Closed({
+        Invoke-GuardedUiAction "DetailedPanel.Closed" {
+            $detailState = Get-DetailedPanelState
+            $detailState.Window = $null
+            $detailState.Outer = $null
+            $detailState.Content = $null
+            $detailState.ProviderSections = [ordered]@{}
+            $detailState.IsOpen = $false
+            $detailState.HasCustomPosition = $false
+        } | Out-Null
+    })
+
+    $state.Window = $window
+    $state.Outer = $outer
+    $state.Content = $content
+    $state.ProviderSections = $providerSections
+
+    $contextMenuOpeningHandler = {
+        param($sender, $event)
+        Invoke-GuardedUiAction "DetailedPanel.ContextMenu.Opening" {
+            $detailState = Get-DetailedPanelState
+            if (-not $detailState.Controls) {
+                return
+            }
+
+            $sender.ContextMenu = Build-ProviderContextMenu $detailState.Controls.Window $detailState.Controls
+        } | Out-Null
+    }
+    $outer.ContextMenu = Build-ProviderContextMenu $controls.Window $controls
+    $outer.Add_ContextMenuOpening($contextMenuOpeningHandler)
+
+    Sync-DetailedPanelProviderVisibility $state
+    return $window
+}
+
+function Hide-DetailedPanelWindow {
+    $state = Get-DetailedPanelState
+    $state.IsOpen = $false
+    $state.HasCustomPosition = $false
+    if ($state.Window) {
+        try {
+            $state.Window.Hide()
+        } catch {
+        }
+    }
+}
+
+function Show-DetailedPanelWindow($controls) {
+    if (-not $script:CompactMode) {
+        return
+    }
+
+    $state = Get-DetailedPanelState $controls
+    Hide-HoverDetailWindow
+    $window = Initialize-DetailedPanelWindow $controls
+    Update-DetailedPanelContent
+    Sync-DetailedPanelProviderVisibility $state
+    Resize-DetailedPanelWindow
+
+    if (-not $state.HasCustomPosition) {
+        Set-DetailedPanelDefaultPosition $window
+    }
+
+    if (-not $window.IsVisible) {
+        $window.Show()
+    }
+
+    $state.IsOpen = $true
+    Set-WindowTopmost $window
+}
+
+function Toggle-DetailedPanelWindow($controls) {
+    if (-not $script:CompactMode) {
+        return
+    }
+
+    if (Test-IsDetailedPanelVisible) {
+        Hide-DetailedPanelWindow
+        return
+    }
+
+    Show-DetailedPanelWindow $controls
+}
+
+function Update-DetailedPanelSnapshot($controls, $providerUsageMap, $activity) {
+    $state = Get-DetailedPanelState $controls
+    $state.UsageMap = $providerUsageMap
+    $state.Activity = $activity
+
+    if (-not (Test-IsDetailedPanelVisible)) {
+        return
+    }
+
+    Update-DetailedPanelContent
+    Resize-DetailedPanelWindow
+}
+
+function Sync-DetailedPanelVisibility($controls = $null) {
+    $state = Get-DetailedPanelState $controls
+    if (-not $script:CompactMode) {
+        Hide-DetailedPanelWindow
+        return
+    }
+
+    if (-not (Test-IsDetailedPanelVisible)) {
+        return
+    }
+
+    Sync-DetailedPanelProviderVisibility $state
+    Update-DetailedPanelContent
+    Resize-DetailedPanelWindow
+}
+
+function Reset-CompactPointerState {
+    $script:CompactPointerState.Tracking = $false
+    $script:CompactPointerState.Dragged = $false
+    $script:CompactPointerState.StartPoint = $null
+}
+
 function Get-ProviderActionSummary($providerId) {
     $status = Get-ProviderActionStatus $providerId
     if (-not $status) {
@@ -5348,6 +5819,7 @@ function Apply-WidgetData($controls, $usage, $minimax, $activity, $grok = $null,
     }
 
     Update-HoverDetailSnapshot $controls $providerUsageMap $activity
+    Update-DetailedPanelSnapshot $controls $providerUsageMap $activity
 
     $statusUsage = @($usage, $minimax, $grok, $antigravity) | Where-Object { $_ -and $_.ok } | Select-Object -First 1
     $controls.Updated.Text = if ($statusUsage) { "Updated " + (Format-ProviderUpdatedText $statusUsage) } else { "Updated " + (Get-Date).ToString("HH:mm:ss") }
@@ -5409,7 +5881,7 @@ function Invoke-ProviderRefreshAction($providerId, $controls) {
 function Update-Widget($controls) {
     $usage = Get-CodexUsage
     $activity = Get-TokenActivitySummary
-    $minimax = if ([bool](Get-ObjectValue $script:ProviderEnabledMap "minimax" $false)) {
+    $minimax = if (Test-ProviderPollingEnabled "minimax") {
         Get-MinimaxUsage
     } else {
         $script:MinimaxRemoteState.Usage
@@ -5664,6 +6136,7 @@ function Build-Widget {
         Updated = $updated
     }
     $null = Get-HoverDetailState $controls
+    $null = Get-DetailedPanelState $controls
 
     foreach ($providerId in (Get-ProviderIds)) {
         $providerSection = Get-ObjectValue $providerSections $providerId $null
@@ -5714,10 +6187,17 @@ function Build-Widget {
     $dragHandler = {
         param($sender, $event)
         Invoke-GuardedUiAction "Outer.MouseLeftButtonDown" {
+            if ($event.ChangedButton -ne [System.Windows.Input.MouseButton]::Left) {
+                return
+            }
+
             Hide-HoverDetailWindow
-            if ($event.ClickCount -ge 2) {
-                Toggle-WidgetMode $window $controls
-                $event.Handled = $true
+
+            if ($script:CompactMode) {
+                $script:CompactPointerState.Tracking = $true
+                $script:CompactPointerState.Dragged = $false
+                $script:CompactPointerState.StartPoint = $event.GetPosition($window)
+                try { $outer.CaptureMouse() } catch { }
                 return
             }
 
@@ -5727,6 +6207,73 @@ function Build-Widget {
         } | Out-Null
     }
     $outer.Add_MouseLeftButtonDown($dragHandler)
+
+    $outer.Add_MouseMove({
+        param($sender, $event)
+        Invoke-GuardedUiAction "Outer.MouseMove" {
+            if (-not $script:CompactMode -or -not $script:CompactPointerState.Tracking) {
+                return
+            }
+
+            if ([System.Windows.Input.Mouse]::LeftButton -ne [System.Windows.Input.MouseButtonState]::Pressed) {
+                return
+            }
+
+            $start = $script:CompactPointerState.StartPoint
+            if (-not $start) {
+                return
+            }
+
+            $current = $event.GetPosition($window)
+            $dx = [Math]::Abs($current.X - $start.X)
+            $dy = [Math]::Abs($current.Y - $start.Y)
+            if ($dx -lt $script:CompactDragThreshold -and $dy -lt $script:CompactDragThreshold) {
+                return
+            }
+
+            $script:CompactPointerState.Dragged = $true
+            $script:CompactPointerState.Tracking = $false
+            $script:CompactPointerState.StartPoint = $null
+            try { $outer.ReleaseMouseCapture() } catch { }
+
+            if ([System.Windows.Input.Mouse]::LeftButton -eq [System.Windows.Input.MouseButtonState]::Pressed) {
+                try { $window.DragMove() } catch { }
+            }
+        } | Out-Null
+    })
+
+    $outer.Add_MouseLeftButtonUp({
+        param($sender, $event)
+        Invoke-GuardedUiAction "Outer.MouseLeftButtonUp" {
+            if ($event.ChangedButton -ne [System.Windows.Input.MouseButton]::Left) {
+                return
+            }
+
+            $wasTracking = [bool]$script:CompactPointerState.Tracking
+            $wasDragged = [bool]$script:CompactPointerState.Dragged
+            try { $outer.ReleaseMouseCapture() } catch { }
+            Reset-CompactPointerState
+
+            if (-not $script:CompactMode -or -not $wasTracking -or $wasDragged) {
+                return
+            }
+
+            if ($event.ClickCount -gt 1) {
+                return
+            }
+
+            Toggle-DetailedPanelWindow $controls
+            $event.Handled = $true
+        } | Out-Null
+    })
+
+    $outer.Add_LostMouseCapture({
+        Invoke-GuardedUiAction "Outer.LostMouseCapture" {
+            if (-not $script:CompactPointerState.Tracking) {
+                Reset-CompactPointerState
+            }
+        } | Out-Null
+    })
 
     $window.Add_LocationChanged({
         Invoke-GuardedUiAction "Window.LocationChanged" {
@@ -5758,6 +6305,7 @@ function Build-Widget {
     $window.Add_Closed({
         Invoke-GuardedUiAction "Window.Closed" {
             Hide-HoverDetailWindow
+            Hide-DetailedPanelWindow
             $hoverState = Get-HoverDetailState
             Stop-DispatcherTimer $hoverState.OpenTimer
             Stop-DispatcherTimer $hoverState.CloseTimer
@@ -5767,6 +6315,14 @@ function Build-Widget {
                 } catch {
                 }
                 $hoverState.Window = $null
+            }
+            $detailedState = Get-DetailedPanelState
+            if ($detailedState.Window) {
+                try {
+                    $detailedState.Window.Close()
+                } catch {
+                }
+                $detailedState.Window = $null
             }
             if ($null -ne $script:CompactTopmostTimer) {
                 $script:CompactTopmostTimer.Stop()

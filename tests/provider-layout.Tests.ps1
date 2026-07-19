@@ -75,4 +75,24 @@ Describe "Compact layout helpers" {
         $placement.Left | Should Be 920
         $placement.Top | Should Be 134
     }
+
+    It "places the detailed panel on the right side and vertically centered" {
+        $popupSize = [pscustomobject]@{ Width = 360; Height = 400 }
+        $workArea = [pscustomobject]@{ Left = 0; Top = 0; Width = 1920; Height = 1080; Right = 1920; Bottom = 1080 }
+
+        $placement = Get-DetailedPanelPlacement $popupSize $workArea 12
+
+        $placement.Left | Should Be 1548
+        $placement.Top | Should Be 340
+    }
+
+    It "clamps the detailed panel into the work area when the popup is taller than the screen" {
+        $popupSize = [pscustomobject]@{ Width = 360; Height = 900 }
+        $workArea = [pscustomobject]@{ Left = 100; Top = 50; Width = 800; Height = 600; Right = 900; Bottom = 650 }
+
+        $placement = Get-DetailedPanelPlacement $popupSize $workArea 12
+
+        $placement.Left | Should Be 528
+        $placement.Top | Should Be 50
+    }
 }
