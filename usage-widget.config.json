@@ -44,6 +44,7 @@
                  "enabled":  false,
                  "logPath":  "",
                  "staleAfterSeconds":  900,
+                 "refreshSeconds":  300,
                  "apiTimeoutSeconds":  12
              },
     "window":  {

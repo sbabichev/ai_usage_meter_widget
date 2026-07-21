@@ -1,6 +1,6 @@
 # Codex Usage Meter Agent Instructions
 
-This repository contains a Windows PowerShell + WPF tray-style widget for monitoring Codex and Minimax usage limits.
+This repository contains a Windows PowerShell + WPF tray-style widget for monitoring Codex, MiniMax, Grok, and Antigravity usage limits.
 
 ## Project Context
 
@@ -18,6 +18,9 @@ This repository contains a Windows PowerShell + WPF tray-style widget for monito
 - Reads Codex telemetry from `%USERPROFILE%\.codex\sessions\**\*.jsonl`.
 - Uses only valid Codex `rate_limits` events where `limit_id=codex`.
 - Reads MiniMax subscription quotas from configured `mmx quota --output json --non-interactive` output via SSH/HTTP/file.
+- Reads Grok weekly subscription usage from `%USERPROFILE%\.grok\logs\unified.jsonl` (`billing: fetched credits config`).
+- Grok: single weekly window from `creditUsagePercent`; missing percent with a valid weekly period means `0%` (common right after reset).
+- When Grok local data is missing/stale, auto-refreshes via CLI auth against `cli-chat-proxy.../v1/billing?format=credits` every `refreshSeconds` (default 300); manual `API` button remains as force refresh.
 - Codex: `primary` = current 5-hour session, `secondary` = weekly limit.
 - MiniMax: `primary` = current interval, `secondary` = weekly limit.
 - Treats MiniMax `current_interval_usage_count` and `current_weekly_usage_count` as used counts.

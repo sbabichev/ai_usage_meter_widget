@@ -44,4 +44,25 @@ Describe "Grok provider helpers" {
         $usage.source | Should Be "api"
         $usage.primary.used_percent | Should Be 61
     }
+
+    It "accepts live api payloads that omit creditUsagePercent at zero usage" {
+        $response = [pscustomobject]@{
+            config = [pscustomobject]@{
+                currentPeriod = [pscustomobject]@{
+                    type = "USAGE_PERIOD_TYPE_WEEKLY"
+                    start = "2026-07-21T06:58:46.185671+00:00"
+                    end = "2026-07-28T06:58:46.185671+00:00"
+                }
+                isUnifiedBillingUser = $true
+            }
+            subscriptionTier = "X Premium"
+        }
+
+        $usage = Convert-GrokBillingApiResponse $response $null
+
+        $usage.ok | Should Be $true
+        $usage.primary.used_percent | Should Be 0
+        $usage.plan | Should Be "X Premium"
+        $usage.source | Should Be "api"
+    }
 }

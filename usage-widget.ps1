@@ -64,12 +64,14 @@ $script:MinimaxDefaultRefreshSeconds = 300
 $script:MinimaxTokenPlanUrl = "https://api.minimax.io/v1/token_plan/remains"
 $script:GrokBillingApiUrl = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 $script:GrokClientVersion = $null
+$script:GrokDefaultRefreshSeconds = 300
 $script:MinimaxRemoteState = @{
     LastFetch = $null
     Usage = $null
     Error = $null
 }
 $script:GrokRemoteState = @{
+    LastFetch = $null
     Usage = $null
     Error = $null
     RefreshStatus = $null
@@ -3268,12 +3270,17 @@ function Get-AntigravityUsage {
 function Get-GrokSettings {
     $config = Read-Config
     $grok = Get-ProviderConfigObject $config "grok"
+    $refreshSeconds = Convert-ToNullableNumber (Get-ObjectValue $grok "refreshSeconds" $script:GrokDefaultRefreshSeconds)
+    if ($null -eq $refreshSeconds -or $refreshSeconds -le 0) {
+        $refreshSeconds = $script:GrokDefaultRefreshSeconds
+    }
 
     return [pscustomobject]@{
         Enabled = Convert-ToBoolean (Get-ObjectValue $grok "enabled" $null) $false
         LogPath = Get-FirstObjectValue $grok @("logPath", "log", "path", "billingLogPath")
         StaleAfterSeconds = [Math]::Max(60, [int](Convert-ToNullableNumber (Get-ObjectValue $grok "staleAfterSeconds" $script:StaleAfterSeconds)))
         ApiTimeoutSeconds = [Math]::Max(3, [int](Convert-ToNullableNumber (Get-ObjectValue $grok "apiTimeoutSeconds" 12)))
+        RefreshSeconds = [int][Math]::Max(30, [Math]::Round([double]$refreshSeconds))
     }
 }
 
@@ -3341,19 +3348,44 @@ function Set-GrokUsageFreshness($usage, $staleAfterSeconds) {
     return $usage
 }
 
-function Convert-GrokBillingConfigToUsage($config, $updatedValue = $null, $source = "local_log", $plan = "Grok") {
+function Test-GrokWeeklyBillingConfig($config) {
     if (-not $config) {
-        return $null
+        return $false
     }
 
-    $usedPercent = Convert-ToNullableNumber (Get-ObjectValue $config "creditUsagePercent" $null)
-    if ($null -eq $usedPercent) {
+    $currentPeriod = Get-ObjectValue $config "currentPeriod" $null
+    if ($currentPeriod) {
+        return $true
+    }
+
+    # Unified weekly credits payloads omit creditUsagePercent at 0% after a period reset,
+    # but still carry period bounds and the unified-billing flag.
+    $isUnified = Convert-ToBoolean (Get-ObjectValue $config "isUnifiedBillingUser" $null) $false
+    $periodStart = Get-ObjectValue $config "billingPeriodStart" $null
+    $periodEnd = Get-ObjectValue $config "billingPeriodEnd" $null
+    return ($isUnified -and $null -ne $periodStart -and $null -ne $periodEnd)
+}
+
+function Convert-GrokBillingConfigToUsage($config, $updatedValue = $null, $source = "local_log", $plan = "Grok") {
+    if (-not $config) {
         return $null
     }
 
     $currentPeriod = Get-ObjectValue $config "currentPeriod" $null
     $periodStart = Get-ObjectValue $currentPeriod "start" (Get-ObjectValue $config "billingPeriodStart" $null)
     $periodEnd = Get-ObjectValue $currentPeriod "end" (Get-ObjectValue $config "billingPeriodEnd" $null)
+
+    # CLI/API omit creditUsagePercent when weekly usage is 0% (common right after reset).
+    # Treat that as 0 rather than rejecting the whole snapshot and falling back to an older period.
+    $usedPercent = Convert-ToNullableNumber (Get-ObjectValue $config "creditUsagePercent" $null)
+    if ($null -eq $usedPercent) {
+        if (-not (Test-GrokWeeklyBillingConfig $config)) {
+            return $null
+        }
+
+        $usedPercent = 0
+    }
+
     $startSeconds = Convert-ToUnixTimestamp $periodStart
     $endSeconds = Convert-ToUnixTimestamp $periodEnd
     $windowMinutes = if ($startSeconds -gt 0 -and $endSeconds -gt $startSeconds) {
@@ -3513,8 +3545,59 @@ function Invoke-GrokRefreshCore($fetchOperation, $existingUsage = $null) {
     }
 }
 
+function Test-GrokApiRefreshDue($settings) {
+    if (-not $settings) {
+        return $false
+    }
+
+    if (-not $script:GrokRemoteState.LastFetch) {
+        return $true
+    }
+
+    $age = (Get-Date) - $script:GrokRemoteState.LastFetch
+    return ($age.TotalSeconds -ge [double]$settings.RefreshSeconds)
+}
+
+function Invoke-GrokAutoBillingRefresh($existingUsage, $settings, $fetchOperation = $null) {
+    if (-not (Test-GrokApiRefreshDue $settings)) {
+        return [pscustomobject]@{
+            Usage = $existingUsage
+            Error = $null
+            Attempted = $false
+        }
+    }
+
+    if (-not $fetchOperation) {
+        $fetchOperation = { Invoke-GrokLiveBillingFetch }
+    }
+
+    $result = Invoke-GrokRefreshCore $fetchOperation $existingUsage
+    $script:GrokRemoteState.LastFetch = Get-Date
+    $script:GrokRemoteState.RefreshStatus = $result.Status
+
+    if ($result.Error) {
+        Write-WidgetLog ("Grok auto API refresh failed: {0}" -f $result.Error)
+        return [pscustomobject]@{
+            Usage = $existingUsage
+            Error = $result.Error
+            Attempted = $true
+        }
+    }
+
+    if ($result.Usage -and $result.Usage.primary) {
+        Write-WidgetLog ("Grok auto API refresh succeeded: weekly {0:N1}%." -f [double]$result.Usage.primary.used_percent)
+    }
+
+    return [pscustomobject]@{
+        Usage = $result.Usage
+        Error = $null
+        Attempted = $true
+    }
+}
+
 function Invoke-GrokManualRefresh($controls = $null) {
     $result = Invoke-GrokRefreshCore { Invoke-GrokLiveBillingFetch } $script:GrokRemoteState.Usage
+    $script:GrokRemoteState.LastFetch = Get-Date
     if ($result.Usage) {
         $script:GrokRemoteState.Usage = Set-GrokUsageFreshness $result.Usage (Get-GrokSettings).StaleAfterSeconds
         if ($result.Error) {
@@ -3549,7 +3632,7 @@ function Read-GrokBillingUsageFromLog($path) {
         return $null
     }
 
-    $lines = Get-Content $path -Tail 250 -ErrorAction SilentlyContinue
+    $lines = Get-Content $path -Tail 400 -ErrorAction SilentlyContinue
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
         $line = $lines[$i]
         if ([string]::IsNullOrWhiteSpace($line) -or $line -notmatch 'billing: fetched credits config') {
@@ -3584,39 +3667,58 @@ function Get-GrokUsage {
     }
 
     $logPath = if ($settings.LogPath) { $settings.LogPath } else { $script:GrokLogsPath }
-
+    $logUsage = $null
     try {
         $logUsage = Read-GrokBillingUsageFromLog $logPath
-        if (-not $logUsage) {
-            throw "No Grok billing snapshot found"
-        }
-
-        $usage = Get-NewerUsage $logUsage $script:GrokRemoteState.Usage
-        $usage = Set-GrokUsageFreshness $usage $settings.StaleAfterSeconds
-
-        if ($usage -ne $script:GrokRemoteState.Usage) {
-            $script:GrokRemoteState.Usage = $usage
-        }
-        $script:GrokRemoteState.Error = $null
-        return $usage
     } catch {
-        $script:GrokRemoteState.Error = $_.Exception.Message
-        if ($script:GrokRemoteState.Usage) {
-            $script:GrokRemoteState.Usage = Set-GrokUsageFreshness $script:GrokRemoteState.Usage $settings.StaleAfterSeconds
-            $script:GrokRemoteState.Usage.error = $_.Exception.Message
-            return $script:GrokRemoteState.Usage
+        $logUsage = $null
+    }
+
+    $usage = Get-NewerUsage $logUsage $script:GrokRemoteState.Usage
+    if ($usage -and $usage.ok) {
+        $usage = Set-GrokUsageFreshness $usage $settings.StaleAfterSeconds
+    }
+
+    $needsLive = (-not $usage) -or (-not $usage.ok) -or [bool]$usage.isStale
+    if ($needsLive) {
+        $auto = Invoke-GrokAutoBillingRefresh $usage $settings
+        if (-not $auto.Error -and $auto.Usage -and $auto.Usage.ok) {
+            $usage = Set-GrokUsageFreshness $auto.Usage $settings.StaleAfterSeconds
+            $script:GrokRemoteState.Usage = $usage
+            $script:GrokRemoteState.Error = $null
+            return $usage
         }
 
-        return [pscustomobject]@{
-            ok = $false
-            configured = $true
-            message = "Grok usage unavailable"
-            plan = "unknown"
-            updated = Get-Date
-            error = $_.Exception.Message
-            primary = $null
-            secondary = $null
+        if ($auto.Error -and (-not $usage -or -not $usage.ok)) {
+            $script:GrokRemoteState.Error = $auto.Error
         }
+    }
+
+    if ($usage -and $usage.ok) {
+        $script:GrokRemoteState.Usage = $usage
+        if (-not $usage.isStale) {
+            $script:GrokRemoteState.Error = $null
+        }
+        return $usage
+    }
+
+    if ($script:GrokRemoteState.Usage) {
+        $script:GrokRemoteState.Usage = Set-GrokUsageFreshness $script:GrokRemoteState.Usage $settings.StaleAfterSeconds
+        if ($script:GrokRemoteState.Error) {
+            $script:GrokRemoteState.Usage.error = $script:GrokRemoteState.Error
+        }
+        return $script:GrokRemoteState.Usage
+    }
+
+    return [pscustomobject]@{
+        ok = $false
+        configured = $true
+        message = "Grok usage unavailable"
+        plan = "unknown"
+        updated = Get-Date
+        error = if ($script:GrokRemoteState.Error) { $script:GrokRemoteState.Error } else { "No Grok billing snapshot found" }
+        primary = $null
+        secondary = $null
     }
 }
 

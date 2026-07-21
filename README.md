@@ -89,6 +89,7 @@ Example local config:
   "grok": {
     "enabled": true,
     "staleAfterSeconds": 900,
+    "refreshSeconds": 300,
     "apiTimeoutSeconds": 12
   }
 }
@@ -102,15 +103,17 @@ For `source: "token_plan"`, the widget calls `GET https://api.minimax.io/v1/toke
 
 ## Grok Limits
 
-Grok uses the local CLI billing log by default:
+Grok tracks the same weekly subscription pool that the Grok CLI shows in its usage UI (shared weekly credits, not public API RPS/TPM limits).
+
+Default source is the local CLI billing log:
 
 ```text
 %USERPROFILE%\.grok\logs\unified.jsonl
 ```
 
-The widget reads the newest `billing: fetched credits config` entry, treats `creditUsagePercent` as used percent, and shows Grok as a single weekly window. It does not invent a fake session bar for Grok.
+The widget reads the newest `billing: fetched credits config` entry and maps `creditUsagePercent` to used percent for a single weekly window. When the CLI/API omit `creditUsagePercent` (common at 0% right after a weekly reset), the widget treats that as `0% used` instead of keeping an older period snapshot. It does not invent a fake session bar for Grok.
 
-If Grok is enabled, the full Grok panel also shows a small `API` button. That button performs a best-effort manual refresh against the currently installed CLI auth context. This is not a documented public xAI subscription API, so it may stop working after CLI changes. The widget only uses it on click, never polls it in the background, and never writes Grok auth secrets into checked-in config or `usage-widget.state.json`.
+While Grok is enabled, the widget also does a best-effort automatic live refresh through the installed CLI auth context when local data is missing or stale (`refreshSeconds`, default 300). The full Grok panel still has a small `API` button for an immediate force refresh. This live endpoint is undocumented and may change with CLI updates; auth secrets are never written into checked-in config or `usage-widget.state.json`.
 
 ## Controls
 
@@ -132,4 +135,4 @@ If Grok is enabled, the full Grok panel also shows a small `API` button. That bu
 
 ## Privacy
 
-By default, the app reads local Codex session JSONL files. If MiniMax is enabled, it also runs the configured HTTPS or SSH quota fetch. If Grok is enabled, it reads local Grok CLI billing logs and only touches the undocumented live billing endpoint when you click the manual `API` refresh button.
+By default, the app reads local Codex session JSONL files. If MiniMax is enabled, it also runs the configured HTTPS or SSH quota fetch. If Grok is enabled, it reads local Grok CLI billing logs and, when that data is missing or stale, may call the undocumented live billing endpoint using the current CLI auth context.
